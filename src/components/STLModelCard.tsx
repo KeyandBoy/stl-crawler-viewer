@@ -18,10 +18,24 @@ interface STLModelCardProps {
 export function STLModelCard({ model, onDelete }: STLModelCardProps) {
   const [showViewer, setShowViewer] = useState(false);
 
+  // 判断是否为 Vercel Blob URL（需要走签名路由）
+  const isPrivateBlob = model.url.includes('blob.vercel-storage.com');
+  const viewUrl = isPrivateBlob ? `/api/get-blob?url=${encodeURIComponent(model.url)}` : model.url;
+
   const handleDownload = async () => {
     try {
-      const response = await fetch(model.url);
-      const blob = await response.blob();
+      let blob: Blob;
+      
+      if (isPrivateBlob) {
+        // Private Blob：走签名路由
+        const response = await fetch(viewUrl);
+        blob = await response.blob();
+      } else {
+        // 本地文件：直接获取
+        const response = await fetch(model.url);
+        blob = await response.blob();
+      }
+
       const blobUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = blobUrl;
@@ -30,6 +44,7 @@ export function STLModelCard({ model, onDelete }: STLModelCardProps) {
       window.URL.revokeObjectURL(blobUrl);
     } catch (error) {
       console.error('Download failed:', error);
+      alert('下载失败，请重试');
     }
   };
 
@@ -42,7 +57,7 @@ export function STLModelCard({ model, onDelete }: STLModelCardProps) {
       <CardContent>
         {showViewer && (
           <div className="mb-4">
-            <STLViewer url={model.url} className="h-[400px] rounded-lg overflow-hidden" />
+            <STLViewer url={viewUrl} className="h-[400px] rounded-lg overflow-hidden" />
           </div>
         )}
         <div className="flex gap-2">
