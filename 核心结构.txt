@@ -1,0 +1,14 @@
+项目：STL Model Crawler & Viewer
+技术栈：Next.js + TypeScript + Three.js + shadcn/ui + Tailwind CSS + Axios+Cheerio
+核心功能：STL模型爬虫搜索、3D在线预览、本地上传/下载/管理、个人模型库
+核心文件：
+src/app/page.tsx
+src/components/STLModelCard.tsx
+src/components/STLViewer.tsx
+src/app/api/search-stl/route.ts
+src/app/api/list-stl/route.ts
+src/app/api/upload-stl/route.ts
+src/app/api/download-stl/route.ts
+src/app/api/proxy-download/route.ts
+存储目录：public/stl-models
+我之后会问这个软件的相关问题，请你记住项目结构。
