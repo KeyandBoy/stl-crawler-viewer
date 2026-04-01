@@ -2,7 +2,11 @@ import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 
-const USE_BLOB = !!process.env.BLOB_READ_WRITE_TOKEN;
+// 调试：打印环境变量状态
+const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
+const USE_BLOB = !!BLOB_TOKEN;
+console.log('[list-stl] BLOB_READ_WRITE_TOKEN exists:', !!BLOB_TOKEN);
+console.log('[list-stl] USE_BLOB:', USE_BLOB);
 
 export async function GET() {
   try {
@@ -16,6 +20,7 @@ export async function GET() {
           url: b.url,
           filename: b.pathname.replace('stl-models/', ''),
         }));
+      console.log('[list-stl] Found', stlFiles.length, 'files in Vercel Blob');
       return NextResponse.json({ success: true, files: stlFiles, total: stlFiles.length });
     }
 
@@ -25,10 +30,11 @@ export async function GET() {
     const files = fs.readdirSync(STORAGE_DIR)
       .filter(f => f.toLowerCase().endsWith('.stl'))
       .map(f => ({ key: f, url: `/stl-models/${f}`, filename: f }));
+    console.log('[list-stl] Found', files.length, 'local files');
     return NextResponse.json({ success: true, files, total: files.length });
 
   } catch (error) {
-    console.error('List STL error:', error);
+    console.error('[list-stl] Error:', error);
     return NextResponse.json({ success: true, files: [], total: 0 });
   }
 }
