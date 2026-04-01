@@ -1,25 +1,16 @@
-import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
-import path from 'path';
+import { NextResponse } from 'next/server';
+import { list } from '@vercel/blob';
 
-// 本地存储目录
-const STORAGE_DIR = path.join(process.cwd(), 'public', 'stl-models');
-
-// 自动创建文件夹
-if (!fs.existsSync(STORAGE_DIR)) {
-  fs.mkdirSync(STORAGE_DIR, { recursive: true });
-}
-
-export async function GET(request: NextRequest) {
+export async function GET() {
   try {
-    const files = fs.readdirSync(STORAGE_DIR);
-    
-    const stlFiles = files
-      .filter(file => file.toLowerCase().endsWith('.stl'))
-      .map(file => ({
-        key: file,
-        url: `/stl-models/${file}`,
-        filename: file,
+    const { blobs } = await list({ prefix: 'stl-models/' });
+
+    const stlFiles = blobs
+      .filter(b => b.pathname.toLowerCase().endsWith('.stl'))
+      .map(b => ({
+        key: b.pathname.replace('stl-models/', ''),
+        url: b.url,
+        filename: b.pathname.replace('stl-models/', ''),
       }));
 
     return NextResponse.json({

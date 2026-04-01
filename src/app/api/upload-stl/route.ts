@@ -1,18 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
-import path from 'path';
-
-const STORAGE_DIR = path.join(process.cwd(), 'public', 'stl-models');
-
-if (!fs.existsSync(STORAGE_DIR)) {
-  fs.mkdirSync(STORAGE_DIR, { recursive: true });
-}
+import { put } from '@vercel/blob';
 
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
     const file = formData.get('file') as File;
-    
+
     if (!file) {
       return NextResponse.json({ error: 'File is required' }, { status: 400 });
     }
@@ -21,16 +14,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Only STL files are allowed' }, { status: 400 });
     }
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    const filePath = path.join(STORAGE_DIR, file.name);
-    
-    fs.writeFileSync(filePath, buffer);
+    const blob = await put(`stl-models/${file.name}`, file, {
+      access: 'public',
+      addRandomSuffix: false,
+    });
 
     return NextResponse.json({
       success: true,
       key: file.name,
-      url: `/stl-models/${file.name}`,
+      url: blob.url,
       filename: file.name,
     });
   } catch (error) {

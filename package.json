@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@types/three": "^0.183.1",
+    "@vercel/blob": "^2.3.2",
     "axios": "^1.14.0",
     "cheerio": "^1.2.0",
     "class-variance-authority": "^0.7.1",
