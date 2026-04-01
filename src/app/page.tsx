@@ -149,9 +149,22 @@ export default function Home() {
     event.target.value = '';
   };
 
-  const handleDelete = (key: string) => {
-    setStoredModels(prev => prev.filter(m => m.key !== key));
-    alert('模型已从列表移除！');
+  const handleDelete = async (key: string) => {
+    if (!confirm(`确定删除 ${key}？`)) return;
+    try {
+      const model = storedModels.find(m => m.key === key);
+      if (model?.url) {
+        await fetch('/api/download-stl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: model.url }),
+        });
+      }
+      setStoredModels(prev => prev.filter(m => m.key !== key));
+    } catch (error) {
+      console.error('Delete failed:', error);
+      alert('删除失败，请重试');
+    }
   };
 
   const renderCard = (result: SearchResult) => {
