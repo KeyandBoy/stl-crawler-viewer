@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local STL model files (use Vercel Blob in production)
+/public/stl-models/
