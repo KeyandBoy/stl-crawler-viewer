@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
+import { Readable } from 'stream';
 
 // ===================== 已知可直接下载的文件域名 =====================
 const DIRECT_DL_PATTERNS = [
@@ -21,8 +22,25 @@ function extractFilename(url: string, fallback: string): string {
   return fallback;
 }
 
+// ===================== Node.js Readable → Web ReadableStream =====================
+function nodeStreamToWebStream(nodeStream: Readable): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      nodeStream.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
+      nodeStream.on('end', () => controller.close());
+      nodeStream.on('error', (err) => controller.error(err));
+    },
+    cancel() {
+      nodeStream.destroy();
+    },
+  });
+}
+
 // ===================== 通用下载流 =====================
-async function streamDownload(targetUrl: string, filename: string): Promise<{ stream: unknown; filename: string }> {
+async function streamDownload(
+  targetUrl: string,
+  filename: string
+): Promise<{ stream: ReadableStream<Uint8Array>; filename: string }> {
   const response = await axios.get(targetUrl, {
     timeout: 30000,
     responseType: 'stream',
@@ -43,7 +61,7 @@ async function streamDownload(targetUrl: string, filename: string): Promise<{ st
     }
   }
 
-  return { stream: response.data, filename };
+  return { stream: nodeStreamToWebStream(response.data as Readable), filename };
 }
 
 // ===================== SSRF 校验 =====================
@@ -74,7 +92,7 @@ export async function GET(request: NextRequest) {
         const { url: targetUrl, filename } = fn(url);
         const { stream, filename: finalName } = await streamDownload(targetUrl, filename);
 
-        return new NextResponse(stream as Parameters<typeof NextResponse>['0']['data'], {
+        return new NextResponse(stream, {
           status: 200,
           headers: {
             'Content-Type': 'application/octet-stream',
@@ -88,7 +106,7 @@ export async function GET(request: NextRequest) {
 
     // 兜底：直接代理
     const { stream, filename } = await streamDownload(url, 'model.stl');
-    return new NextResponse(stream as Parameters<typeof NextResponse>['0']['data'], {
+    return new NextResponse(stream, {
       status: 200,
       headers: {
         'Content-Type': 'application/octet-stream',

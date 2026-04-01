@@ -2,8 +2,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  swcMinify: true,
-  // 你的其他配置（比如图片、代理、环境变量等）
+  // swcMinify 已在 Next.js 15+ 默认开启，无需手动配置
 };
 
 export default nextConfig;
