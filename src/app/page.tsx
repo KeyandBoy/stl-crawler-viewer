@@ -93,6 +93,31 @@ export default function Home() {
   ) => {
     if (!url || url === '') return;
     const finalUrl = downloadUrl || url;
+    
+    // Thingiverse zip 链接：直接打开新窗口（需要登录）
+    if (finalUrl.includes('thingiverse.com') && finalUrl.includes('/zip')) {
+      window.open(finalUrl, '_blank');
+      return;
+    }
+    
+    // Printables files 链接：直接打开新窗口
+    if (finalUrl.includes('printables.com') && finalUrl.includes('/files')) {
+      window.open(finalUrl, '_blank');
+      return;
+    }
+    
+    // 爱给网、3D溜溜网等详情页：跳转让用户自己下载
+    if (finalUrl.includes('aigei.com') || finalUrl.includes('3d66.com') || finalUrl.includes('sketchfab.com')) {
+      window.open(finalUrl, '_blank');
+      return;
+    }
+    
+    // Yeggi 聚合链接：跳转
+    if (finalUrl.includes('yeggi.com')) {
+      window.open(finalUrl, '_blank');
+      return;
+    }
+    
     setDownloadingUrls(prev => new Set(prev).add(finalUrl));
     try {
       if (isLocal) {
@@ -106,6 +131,8 @@ export default function Home() {
         await loadStoredModels();
         return;
       }
+      
+      // 其他直链：尝试代理下载
       const proxyUrl = `/api/proxy-download?url=${encodeURIComponent(finalUrl)}`;
       const response = await fetch(proxyUrl);
       if (!response.ok) {
@@ -124,7 +151,8 @@ export default function Home() {
       await loadStoredModels();
     } catch (error) {
       console.error('Download failed:', error);
-      alert(`下载失败：${(error as Error).message}\n\n可复制链接到浏览器下载：\n${finalUrl}`);
+      // 下载失败：直接打开链接让用户自己下载
+      window.open(finalUrl, '_blank');
     } finally {
       setDownloadingUrls(prev => { const n = new Set(prev); n.delete(finalUrl); return n; });
     }
@@ -262,7 +290,7 @@ export default function Home() {
                 {isDownloading
                   ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
                   : <Download className="w-4 h-4 mr-2" />}
-                {isDownloading ? '下载中…' : '▼ 直接下载 STL'}
+                {isDownloading ? '处理中…' : '⬇ 下载模型'}
               </Button>
             )}
             {hasJump && (
