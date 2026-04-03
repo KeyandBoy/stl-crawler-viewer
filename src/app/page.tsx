@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -9,7 +9,8 @@ import { Badge } from '@/components/ui/badge';
 import { STLModelCard } from '@/components/STLModelCard';
 import {
   Search, Download, Loader2, ExternalLink, Upload, RefreshCw,
-  Globe, FileArchive, Image, ArrowRight
+  Globe, FileArchive, Image, ArrowRight, Sparkles, FolderOpen,
+  CheckCircle2, FolderSync
 } from 'lucide-react';
 
 interface SearchResult {
@@ -32,8 +33,6 @@ interface SearchResponse {
   results: SearchResult[];
   hasResult?: boolean;
   emptyTip?: string;
-  curatedCount?: number;
-  crawledCount?: number;
 }
 
 interface StoredModel {
@@ -51,6 +50,11 @@ export default function Home() {
   const [downloadingUrls, setDownloadingUrls] = useState<Set<string>>(new Set());
   const [emptyTip, setEmptyTip] = useState('');
   const [hasSearchResult, setHasSearchResult] = useState(true);
+  const [isBatchClassifying, setIsBatchClassifying] = useState(false);
+  const [classifyProgress, setClassifyProgress] = useState({ current: 0, total: 0, currentFile: '' });
+  const [autoRename, setAutoRename] = useState(true); // 默认开启自动重命名
+  const [viewMode, setViewMode] = useState<'grid' | 'category'>('grid'); // 视图模式
+  const [classifyResults, setClassifyResults] = useState<Record<string, string>>({}); // 存储分类结果
 
   useEffect(() => { loadStoredModels(); }, []);
 
@@ -63,6 +67,40 @@ export default function Home() {
     } catch { /* ignore */ }
     finally { setIsLoading(false); }
   };
+
+  // 按分类分组模型 - 从 classifyResults 获取分类信息
+  const categorizedModels = useMemo(() => {
+    const categories: Record<string, StoredModel[]> = {};
+    const uncategorized: StoredModel[] = [];
+    
+    for (const model of storedModels) {
+      // 优先使用 classifyResults 中的分类信息（来自服务器）
+      const category = classifyResults[model.key];
+      
+      if (category) {
+        if (!categories[category]) {
+          categories[category] = [];
+        }
+        categories[category].push(model);
+      } else {
+        // 备用：检查文件名是否包含分类前缀
+        const name = model.filename;
+        const match = name.match(/^([^/_]+)[/_]/);
+        
+        if (match) {
+          const categoryName = match[1];
+          if (!categories[categoryName]) {
+            categories[categoryName] = [];
+          }
+          categories[categoryName].push(model);
+        } else {
+          uncategorized.push(model);
+        }
+      }
+    }
+    
+    return { categories, uncategorized };
+  }, [storedModels, classifyResults]);
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) { alert('请输入搜索关键词！'); return; }
@@ -88,31 +126,22 @@ export default function Home() {
     }
   };
 
-  const handleDownload = async (
-    url: string, title: string, isLocal = false, downloadUrl?: string
-  ) => {
+  const handleDownload = async (url: string, title: string, isLocal = false, downloadUrl?: string) => {
     if (!url || url === '') return;
     const finalUrl = downloadUrl || url;
     
-    // Thingiverse zip 链接：直接打开新窗口（需要登录）
     if (finalUrl.includes('thingiverse.com') && finalUrl.includes('/zip')) {
       window.open(finalUrl, '_blank');
       return;
     }
-    
-    // Printables files 链接：直接打开新窗口
     if (finalUrl.includes('printables.com') && finalUrl.includes('/files')) {
       window.open(finalUrl, '_blank');
       return;
     }
-    
-    // 爱给网、3D溜溜网等详情页：跳转让用户自己下载
     if (finalUrl.includes('aigei.com') || finalUrl.includes('3d66.com') || finalUrl.includes('sketchfab.com')) {
       window.open(finalUrl, '_blank');
       return;
     }
-    
-    // Yeggi 聚合链接：跳转
     if (finalUrl.includes('yeggi.com')) {
       window.open(finalUrl, '_blank');
       return;
@@ -132,7 +161,6 @@ export default function Home() {
         return;
       }
       
-      // 其他直链：尝试代理下载
       const proxyUrl = `/api/proxy-download?url=${encodeURIComponent(finalUrl)}`;
       const response = await fetch(proxyUrl);
       if (!response.ok) {
@@ -151,7 +179,6 @@ export default function Home() {
       await loadStoredModels();
     } catch (error) {
       console.error('Download failed:', error);
-      // 下载失败：直接打开链接让用户自己下载
       window.open(finalUrl, '_blank');
     } finally {
       setDownloadingUrls(prev => { const n = new Set(prev); n.delete(finalUrl); return n; });
@@ -193,6 +220,120 @@ export default function Home() {
       console.error('Delete failed:', error);
       alert('删除失败，请重试');
     }
+  };
+
+  const handleRename = (oldKey: string, newFilename: string) => {
+    console.log(`[Page] Model renamed: ${oldKey} → ${newFilename}`);
+    // 刷新列表
+    loadStoredModels();
+  };
+
+  // 批量 AI 分类 + 自动重命名
+  const handleBatchClassify = async () => {
+    if (storedModels.length === 0) {
+      alert('图书馆中没有模型可以分类');
+      return;
+    }
+    
+    const confirmed = confirm(
+      `将对 ${storedModels.length} 个模型进行 AI 分类并自动重命名。\n\n` +
+      `流程：\n` +
+      `1. AI 识别模型类型\n` +
+      `2. 自动重命名为「分类_原文件名.stl」\n\n` +
+      `这可能需要几分钟，确定继续吗？`
+    );
+    
+    if (!confirmed) return;
+    
+    setIsBatchClassifying(true);
+    setClassifyProgress({ current: 0, total: storedModels.length, currentFile: '' });
+    
+    const results: Record<string, string> = {}; // 存储分类结果
+    const renamedFiles: { oldKey: string; newKey: string; category: string; success: boolean }[] = [];
+    
+    // 动态导入分类函数
+    const { classifySTLModel } = await import('@/components/STLClassifier');
+    
+    for (let i = 0; i < storedModels.length; i++) {
+      const model = storedModels[i];
+      setClassifyProgress({ 
+        current: i + 1, 
+        total: storedModels.length,
+        currentFile: model.filename
+      });
+      
+      try {
+        // 判断 URL 类型
+        const isPrivateBlob = model.url.includes('blob.vercel-storage.com');
+        const fetchUrl = isPrivateBlob ? `/api/get-blob?url=${encodeURIComponent(model.url)}` : model.url;
+        
+        // AI 分类
+        const predictions = await classifySTLModel(fetchUrl);
+        
+        if (predictions.length > 0) {
+          const category = predictions[0].className.replace(/[/\s]/g, '_');
+          const originalName = model.filename.replace('.stl', '').replace('.STL', '');
+          // 不使用子文件夹，直接用分类前缀重命名
+          const newFilename = `${category}_${originalName}.stl`;
+          
+          console.log(`[Batch Classify] ${model.filename} → ${newFilename} (category: ${category})`);
+          
+          // 存储分类结果
+          results[model.key] = category;
+          
+          // 执行重命名
+          const response = await fetch('/api/rename-stl', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              oldKey: model.key,
+              oldUrl: model.url,
+              newFilename,
+            }),
+          });
+          
+          const data = await response.json();
+          
+          if (data.success) {
+            renamedFiles.push({ 
+              oldKey: model.key, 
+              newKey: newFilename, 
+              category, 
+              success: true 
+            });
+            console.log(`[Batch Classify] ✅ 重命名成功: ${model.filename} → ${newFilename}`);
+          } else {
+            renamedFiles.push({ oldKey: model.key, newKey: model.filename, category, success: false });
+            console.error(`[Batch Classify] ❌ 重命名失败: ${model.filename}`, data.error);
+          }
+        }
+      } catch (error) {
+        console.error(`[Batch Classify] 分类失败 for ${model.filename}:`, error);
+        renamedFiles.push({ oldKey: model.key, newKey: model.filename, category: '失败', success: false });
+      }
+      
+      // 短暂延迟
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+    
+    // 更新分类结果状态
+    setClassifyResults(results);
+    setIsBatchClassifying(false);
+    
+    // 刷新列表
+    await loadStoredModels();
+    
+    // 显示结果
+    const successCount = renamedFiles.filter(r => r.success).length;
+    const summary = renamedFiles
+      .map(r => `${r.success ? '✅' : '❌'} ${r.oldKey} → ${r.newKey}`)
+      .join('\n');
+    
+    alert(
+      `✅ 批量分类完成！\n\n` +
+      `成功: ${successCount}/${storedModels.length}\n\n` +
+      `详情：\n${summary}`
+    );
   };
 
   const renderCard = (result: SearchResult) => {
@@ -240,12 +381,7 @@ export default function Home() {
       <Card key={result.id} className="hover:shadow-md transition-shadow overflow-hidden">
         {result.thumbnail && (
           <div className="w-full h-32 bg-gray-100">
-            <img
-              src={result.thumbnail}
-              alt={result.title}
-              className="w-full h-full object-cover"
-              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
-            />
+            <img src={result.thumbnail} alt={result.title} className="w-full h-full object-cover" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
           </div>
         )}
         <CardHeader className="pb-2">
@@ -254,9 +390,7 @@ export default function Home() {
               <CardTitle className="text-base leading-snug line-clamp-2">{result.title}</CardTitle>
               <CardDescription className="flex items-center gap-2 mt-1 text-xs">
                 <span className="flex items-center gap-1">
-                  {result.siteName === '我的图书馆'
-                    ? <FileArchive className="w-3 h-3" />
-                    : <Globe className="w-3 h-3" />}
+                  {result.siteName === '我的图书馆' ? <FileArchive className="w-3 h-3" /> : <Globe className="w-3 h-3" />}
                   {result.siteName}
                 </span>
                 {result.publishTime && <span>· {result.publishTime}</span>}
@@ -268,12 +402,6 @@ export default function Home() {
                   {result.verifiedFree ? '✓ 免费' : '⚠ 付费'}
                 </Badge>
               )}
-              {result.isLocal && (
-                <Badge variant="secondary" className="text-xs">
-                  <Image className="w-3 h-3 mr-1" />
-                  本地
-                </Badge>
-              )}
             </div>
           </div>
         </CardHeader>
@@ -281,44 +409,18 @@ export default function Home() {
           <p className="text-sm text-muted-foreground line-clamp-2 mb-3">{result.snippet}</p>
           <div className="flex flex-col gap-2">
             {hasDownload && !result.isRecommendedSite && (
-              <Button
-                size="sm"
-                onClick={() => handleDownload(result.url, result.title, result.isLocal, result.downloadUrl)}
-                disabled={isDownloading}
-                className="w-full bg-green-600 hover:bg-green-700 text-white font-medium"
-              >
-                {isDownloading
-                  ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  : <Download className="w-4 h-4 mr-2" />}
+              <Button size="sm" onClick={() => handleDownload(result.url, result.title, result.isLocal, result.downloadUrl)} disabled={isDownloading} className="w-full bg-green-600 hover:bg-green-700 text-white font-medium">
+                {isDownloading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Download className="w-4 h-4 mr-2" />}
                 {isDownloading ? '处理中…' : '⬇ 下载模型'}
               </Button>
             )}
             {hasJump && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => handleJump(result.url)}
-                className="w-full border-blue-500 text-blue-600 hover:bg-blue-50"
-              >
+              <Button size="sm" variant="outline" onClick={() => handleJump(result.url)} className="w-full border-blue-500 text-blue-600 hover:bg-blue-50">
                 <ExternalLink className="w-4 h-4 mr-2" />
-                跳转 {result.siteName} 查看详情
-              </Button>
-            )}
-            {isJumpOnly && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => handleJump(result.url)}
-                className="w-full border-gray-400 text-gray-600 hover:bg-gray-50"
-              >
-                <Globe className="w-4 h-4 mr-2" />
-                跳转 {result.siteName} 搜索页
+                跳转查看详情
               </Button>
             )}
           </div>
-          {result.url && result.url.startsWith('http') && (
-            <p className="text-xs text-gray-400 mt-2 truncate">{result.url}</p>
-          )}
         </CardContent>
       </Card>
     );
@@ -330,7 +432,7 @@ export default function Home() {
         <div className="mb-8">
           <h1 className="text-4xl font-bold mb-2">🏛️ STL Model Crawler & Viewer</h1>
           <p className="text-muted-foreground">
-            中国古代建筑3D模型 · 多站点深度爬虫 · <span className="text-green-600 font-medium">直接下载 STL</span>
+            中国古代建筑3D模型 · 多站点深度爬虫 · <span className="text-green-600 font-medium">直接下载 STL</span> · <span className="text-purple-600 font-medium">AI 智能分类</span>
           </p>
         </div>
 
@@ -339,9 +441,7 @@ export default function Home() {
             <TabsTrigger value="search">🔍 搜索下载</TabsTrigger>
             <TabsTrigger value="library">
               📁 我的图书馆
-              {storedModels.length > 0 && (
-                <Badge variant="secondary" className="ml-2">{storedModels.length}</Badge>
-              )}
+              {storedModels.length > 0 && <Badge variant="secondary" className="ml-2">{storedModels.length}</Badge>}
             </TabsTrigger>
           </TabsList>
 
@@ -349,29 +449,17 @@ export default function Home() {
             <Card>
               <CardHeader>
                 <CardTitle>搜索 STL 古建筑模型</CardTitle>
-                <CardDescription>
-                  输入关键词，精确匹配精选模型库 + 多站点真实可下载 STL
-                </CardDescription>
+                <CardDescription>输入关键词，精确匹配精选模型库 + 多站点真实可下载 STL</CardDescription>
               </CardHeader>
               <CardContent>
                 <div className="flex gap-2">
-                  <Input
-                    placeholder="输入古建筑关键词（如：六角亭 / 廊桥 / 四合院 / 牌坊 / 龙）"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-                    className="flex-1 text-base"
-                  />
+                  <Input placeholder="输入古建筑关键词（如：六角亭 / 廊桥 / 四合院 / 牌坊 / 龙）" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleSearch()} className="flex-1 text-base" />
                   <Button onClick={handleSearch} disabled={isSearching} size="lg">
-                    {isSearching
-                      ? <Loader2 className="w-5 h-5 mr-2 animate-spin" />
-                      : <Search className="w-5 h-5 mr-2" />}
+                    {isSearching ? <Loader2 className="w-5 h-5 mr-2 animate-spin" /> : <Search className="w-5 h-5 mr-2" />}
                     {isSearching ? '搜索中…' : '搜索'}
                   </Button>
                 </div>
-                <p className="text-xs text-gray-400 mt-2">
-                  支持：亭子 · 塔 · 桥 · 牌坊 · 殿 · 庙 · 祠堂 · 四合院 · 园林 · 戏台 · 民居 · 龙
-                </p>
+                <p className="text-xs text-gray-400 mt-2">支持：亭子 · 塔 · 桥 · 牌坊 · 殿 · 庙 · 祠堂 · 四合院 · 园林 · 戏台 · 民居 · 龙</p>
               </CardContent>
             </Card>
 
@@ -383,11 +471,7 @@ export default function Home() {
               <CardContent>
                 <div className="flex items-center gap-3">
                   <Input type="file" accept=".stl" onChange={handleFileUpload} className="flex-1" />
-                  <Button asChild>
-                    <label className="cursor-pointer">
-                      <Upload className="w-4 h-4 mr-2" />上传
-                    </label>
-                  </Button>
+                  <Button asChild><label className="cursor-pointer"><Upload className="w-4 h-4 mr-2" />上传</label></Button>
                 </div>
               </CardContent>
             </Card>
@@ -399,9 +483,7 @@ export default function Home() {
                     <Loader2 className="w-10 h-10 animate-spin text-primary" />
                     <div className="text-center">
                       <p className="text-lg font-medium">正在搜索多站点资源…</p>
-                      <p className="text-sm text-muted-foreground mt-1">
-                        Thingiverse · Printables · 爱给网 · 3D溜溜网 · Yeggi · Sketchfab
-                      </p>
+                      <p className="text-sm text-muted-foreground mt-1">Thingiverse · Printables · 爱给网 · 3D溜溜网 · Yeggi · Sketchfab</p>
                     </div>
                   </CardContent>
                 </Card>
@@ -409,30 +491,16 @@ export default function Home() {
                 <>
                   {!hasSearchResult && emptyTip && (
                     <Card className="border-orange-200 bg-orange-50">
-                      <CardContent className="py-3 px-4">
-                        <p className="text-orange-700 text-sm font-medium">{emptyTip}</p>
-                      </CardContent>
+                      <CardContent className="py-3 px-4"><p className="text-orange-700 text-sm font-medium">{emptyTip}</p></CardContent>
                     </Card>
                   )}
                   {searchResults.length > 0 && (
                     <div className="flex items-center justify-between">
-                      <p className="text-sm text-muted-foreground">
-                        共找到 <span className="font-semibold text-foreground">{searchResults.length}</span> 个结果
-                      </p>
-                      <div className="flex gap-2 text-xs text-gray-400">
-                        <span className="flex items-center gap-1">
-                          <Download className="w-3 h-3 text-green-600" /> 直接下载STL
-                        </span>
-                        <span className="flex items-center gap-1">
-                          <ArrowRight className="w-3 h-3 text-blue-600" /> 跳转站点
-                        </span>
-                      </div>
+                      <p className="text-sm text-muted-foreground">共找到 <span className="font-semibold text-foreground">{searchResults.length}</span> 个结果</p>
                     </div>
                   )}
                   {searchResults.length > 0 ? (
-                    <div className="flex flex-col gap-3">
-                      {searchResults.map(renderCard)}
-                    </div>
+                    <div className="flex flex-col gap-3">{searchResults.map(renderCard)}</div>
                   ) : !hasSearchResult ? null : (
                     <Card>
                       <CardContent className="py-12 text-center">
@@ -453,18 +521,63 @@ export default function Home() {
                 <div className="flex items-center justify-between">
                   <div>
                     <CardTitle>📁 我的 STL 图书馆</CardTitle>
-                    <CardDescription>管理已下载的本地古建筑STL模型</CardDescription>
+                    <CardDescription>管理已下载的本地古建筑STL模型，支持 AI 智能分类</CardDescription>
                   </div>
-                  <Button onClick={loadStoredModels} variant="outline" size="sm">
-                    <RefreshCw className="w-4 h-4 mr-2" />刷新
-                  </Button>
+                  <div className="flex gap-2 items-center">
+                    {/* 视图切换 */}
+                    <div className="flex border rounded-lg overflow-hidden">
+                      <button
+                        onClick={() => setViewMode('grid')}
+                        className={`px-3 py-1.5 text-sm ${viewMode === 'grid' ? 'bg-purple-100 text-purple-700' : 'bg-white text-gray-600'}`}
+                      >
+                        📋 列表
+                      </button>
+                      <button
+                        onClick={() => setViewMode('category')}
+                        className={`px-3 py-1.5 text-sm ${viewMode === 'category' ? 'bg-purple-100 text-purple-700' : 'bg-white text-gray-600'}`}
+                      >
+                        📂 分类
+                      </button>
+                    </div>
+                    {/* 批量分类按钮 */}
+                    <Button onClick={handleBatchClassify} variant="outline" size="sm" disabled={isBatchClassifying || storedModels.length === 0} className="bg-purple-600 text-white hover:bg-purple-700 border-purple-600">
+                      {isBatchClassifying ? (
+                        <>
+                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                          {classifyProgress.current}/{classifyProgress.total}
+                        </>
+                      ) : (
+                        <>
+                          <FolderSync className="w-4 h-4 mr-2" />
+                          一键分类收纳
+                        </>
+                      )}
+                    </Button>
+                    <Button onClick={loadStoredModels} variant="outline" size="sm">
+                      <RefreshCw className="w-4 h-4 mr-2" />刷新
+                    </Button>
+                  </div>
                 </div>
               </CardHeader>
               <CardContent>
-                {isLoading ? (
-                  <div className="flex items-center justify-center py-12">
-                    <Loader2 className="w-6 h-6 animate-spin" />
+                {/* 分类进度提示 */}
+                {isBatchClassifying && (
+                  <div className="mb-4 p-4 bg-purple-50 border border-purple-200 rounded-lg">
+                    <div className="flex items-center gap-3">
+                      <Loader2 className="w-5 h-5 animate-spin text-purple-600" />
+                      <div>
+                        <p className="font-medium text-purple-800">正在批量分类...</p>
+                        <p className="text-sm text-purple-600">
+                          进度: {classifyProgress.current}/{classifyProgress.total}
+                          {classifyProgress.currentFile && ` - ${classifyProgress.currentFile}`}
+                        </p>
+                      </div>
+                    </div>
                   </div>
+                )}
+                
+                {isLoading ? (
+                  <div className="flex items-center justify-center py-12"><Loader2 className="w-6 h-6 animate-spin" /></div>
                 ) : storedModels.length === 0 ? (
                   <div className="text-center py-12">
                     <FileArchive className="w-12 h-12 mx-auto text-gray-300 mb-3" />
@@ -474,11 +587,65 @@ export default function Home() {
                       <Search className="w-4 h-4 mr-2" />去搜索
                     </Button>
                   </div>
-                ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                ) : viewMode === 'grid' ? (
+                  /* 列表视图 */
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                     {storedModels.map(model => (
-                      <STLModelCard key={model.key} model={model} onDelete={handleDelete} />
+                      <STLModelCard 
+                        key={model.key} 
+                        model={model} 
+                        onDelete={handleDelete}
+                        onRename={handleRename}
+                        autoRename={autoRename}
+                      />
                     ))}
+                  </div>
+                ) : (
+                  /* 分类视图 */
+                  <div className="space-y-6">
+                    {Object.entries(categorizedModels.categories).map(([category, models]) => (
+                      <div key={category} className="border rounded-lg overflow-hidden">
+                        <div className="bg-purple-50 px-4 py-3 flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <FolderOpen className="w-5 h-5 text-purple-600" />
+                            <span className="font-medium text-purple-800">{category}</span>
+                            <Badge variant="secondary" className="ml-2">{models.length}</Badge>
+                          </div>
+                        </div>
+                        <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                          {models.map(model => (
+                            <STLModelCard 
+                              key={model.key} 
+                              model={model} 
+                              onDelete={handleDelete}
+                              onRename={handleRename}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {categorizedModels.uncategorized.length > 0 && (
+                      <div className="border rounded-lg overflow-hidden border-dashed">
+                        <div className="bg-gray-50 px-4 py-3 flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <FileArchive className="w-5 h-5 text-gray-500" />
+                            <span className="font-medium text-gray-700">未分类</span>
+                            <Badge variant="secondary" className="ml-2">{categorizedModels.uncategorized.length}</Badge>
+                          </div>
+                          <span className="text-xs text-gray-400">点击「一键分类收纳」自动归类</span>
+                        </div>
+                        <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                          {categorizedModels.uncategorized.map(model => (
+                            <STLModelCard 
+                              key={model.key} 
+                              model={model} 
+                              onDelete={handleDelete}
+                              onRename={handleRename}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </CardContent>

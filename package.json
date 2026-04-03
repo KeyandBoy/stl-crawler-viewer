@@ -9,6 +9,8 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@tensorflow-models/mobilenet": "^2.1.1",
+    "@tensorflow/tfjs": "^4.22.0",
     "@types/three": "^0.183.1",
     "@vercel/blob": "^2.3.2",
     "axios": "^1.14.0",
