@@ -18,6 +18,28 @@ interface STLClassifierProps {
 let tfInstance: any = null;
 let mobilenetInstance: any = null;
 let initializing = false;
+let tfInitFailed = false;
+
+// 古建筑相关关键词分类规则
+const CLASSIFICATION_RULES: Record<string, string[]> = {
+  '凉亭': ['凉亭', '亭子', 'pavilion', 'gazebo', 'pavilion', 'booth', 'kiosk'],
+  '塔': ['塔', 'tower', 'pagoda', 'stupa', 'minaret', 'turret'],
+  '桥': ['桥', 'bridge', 'arch', 'viaduct', 'overpass'],
+  '龙': ['龙', 'dragon', '龙舟'],
+  '狮子': ['狮子', 'lion', '石狮'],
+  '雕像': ['雕像', 'statue', 'sculpture', 'figure', 'figurine'],
+  '宫殿': ['宫殿', 'palace', 'castle'],
+  '庙宇': ['庙', 'temple', 'church', 'shrine', 'mosque'],
+  '房屋': ['屋', 'house', 'home', 'hut', 'cottage', 'cabin'],
+  '船': ['船', 'ship', 'boat', 'vessel', 'ferry', 'cruise'],
+  '飞机': ['飞机', 'plane', 'aircraft', 'jet', 'fighter'],
+  '车': ['车', 'car', 'vehicle', 'automobile', 'truck', 'bus'],
+  '动物': ['动物', 'animal', 'cat', 'dog', 'bird', 'fish', 'horse', 'bear', 'rabbit'],
+  '玩具': ['toy', 'toy', 'game', 'puzzle'],
+  '机械': ['gear', '机械', 'machine', 'engine', 'motor', 'robotic'],
+  '工具': ['工具', 'tool', 'hammer', 'wrench', 'saw', 'drill'],
+  '器具': ['瓶', '瓶', 'bottle', 'cup', 'mug', 'bowl', 'plate', 'vase'],
+};
 
 // TensorFlow.js 中文翻译映射
 const TRANSLATIONS: Record<string, string> = {
@@ -27,6 +49,8 @@ const TRANSLATIONS: Record<string, string> = {
   'lion': '狮子', 'statue': '雕像', 'sculpture': '雕塑', 'fountain': '喷泉',
   'garden': '园林', 'courtyard': '庭院', 'building': '建筑', 'house': '房屋',
   'pagoda': '宝塔', 'stupa': '佛塔', 'monastery': '寺院',
+  'ship': '船', 'boat': '船', 'aircraft': '飞机', 'car': '车',
+  'animal': '动物', 'toy': '玩具', 'gear': '机械', 'tool': '工具',
 };
 
 function translate(name: string): string {
@@ -37,35 +61,88 @@ function translate(name: string): string {
   return name;
 }
 
-// 初始化 TensorFlow.js（必须在浏览器环境中）
-async function initTensorFlow(): Promise<{ tf: any; mobilenet: any }> {
+// 基于文件名的分类
+function classifyByFilename(filename: string): ClassificationResult[] {
+  const lowerFilename = filename.toLowerCase();
+  const results: ClassificationResult[] = [];
+  
+  for (const [category, keywords] of Object.entries(CLASSIFICATION_RULES)) {
+    for (const keyword of keywords) {
+      if (lowerFilename.includes(keyword.toLowerCase())) {
+        results.push({
+          className: category,
+          probability: 0.8, // 基于文件名匹配给出较高置信度
+        });
+        break;
+      }
+    }
+  }
+  
+  // 如果没有匹配，返回"未分类"
+  if (results.length === 0) {
+    results.push({
+      className: '未分类',
+      probability: 0.5,
+    });
+  }
+  
+  // 去重并按概率排序
+  const uniqueResults = results.reduce((acc, curr) => {
+    const existing = acc.find(r => r.className === curr.className);
+    if (!existing) {
+      acc.push(curr);
+    }
+    return acc;
+  }, [] as ClassificationResult[]);
+  
+  return uniqueResults.sort((a, b) => b.probability - a.probability).slice(0, 5);
+}
+
+// 尝试初始化 TensorFlow.js
+async function tryInitTensorFlow(): Promise<{ tf: any; mobilenet: any } | null> {
+  if (tfInitFailed) return null;
   if (tfInstance && mobilenetInstance) {
     return { tf: tfInstance, mobilenet: mobilenetInstance };
   }
   
   if (initializing) {
-    // 等待初始化完成
-    await new Promise(r => setTimeout(r, 100));
-    return initTensorFlow();
+    await new Promise(r => setTimeout(r, 200));
+    return tryInitTensorFlow();
   }
   
   initializing = true;
   
   try {
-    // 动态导入
     const tf = await import('@tensorflow/tfjs');
     const mobilenet = await import('@tensorflow-models/mobilenet');
     
-    // 设置后端为 webgl（必须在浏览器中）
     console.log('[STLClassifier] Initializing TensorFlow.js...');
-    await tf.setBackend('webgl');
-    await tf.ready();
     
+    // 尝试设置后端
+    try {
+      await tf.setBackend('webgl');
+    } catch {
+      try {
+        await tf.setBackend('wasm');
+      } catch {
+        try {
+          await tf.setBackend('cpu');
+        } catch {
+          // 所有后端都失败
+        }
+      }
+    }
+    
+    await tf.ready();
     console.log('[STLClassifier] Backend:', tf.getBackend());
     
-    // 加载 MobileNet 模型
-    console.log('[STLClassifier] Loading MobileNet model...');
-    const model = await mobilenet.load({ version: 2, alpha: 1.0 });
+    // 尝试加载模型，设置较短超时
+    const model = await Promise.race([
+      mobilenet.load({ version: 2, alpha: 1.0 }),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Model load timeout')), 10000)
+      ),
+    ]);
     
     tfInstance = tf;
     mobilenetInstance = model;
@@ -75,8 +152,9 @@ async function initTensorFlow(): Promise<{ tf: any; mobilenet: any }> {
     return { tf, mobilenet: model };
   } catch (error) {
     initializing = false;
-    console.error('[STLClassifier] Init failed:', error);
-    throw error;
+    tfInitFailed = true;
+    console.warn('[STLClassifier] TensorFlow.js init failed, will use filename-based classification:', error);
+    return null;
   }
 }
 
@@ -87,8 +165,8 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
   const [results, setResults] = useState<ClassificationResult[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isClient, setIsClient] = useState(false);
+  const [usingFallback, setUsingFallback] = useState(false);
 
-  // 确保在客户端
   useEffect(() => {
     setIsClient(true);
   }, []);
@@ -124,7 +202,6 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
           
           const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
           
-          // 光源
           scene.add(new THREE.AmbientLight(0x606060, 2));
           
           const light1 = new THREE.DirectionalLight(0xffffff, 1);
@@ -135,7 +212,6 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
           light2.position.set(-1, -1, -1);
           scene.add(light2);
           
-          // 网格
           const material = new THREE.MeshPhongMaterial({
             color: 0x00a8ff,
             specular: 0x222222,
@@ -144,7 +220,6 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
           });
           const mesh = new THREE.Mesh(geometry, material);
           
-          // 居中和缩放
           geometry.computeBoundingBox();
           const box = geometry.boundingBox!;
           const center = new THREE.Vector3();
@@ -159,17 +234,12 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
           
           scene.add(mesh);
           
-          // 多角度渲染
           const angles = [
-            { pos: [0, 0, 60], name: 'front' },
-            { pos: [40, 40, 40], name: 'iso1' },
-            { pos: [-40, 40, 40], name: 'iso2' },
-            { pos: [0, 60, 0], name: 'top' },
-            { pos: [60, 0, 0], name: 'side' },
+            [0, 0, 60], [40, 40, 40], [-40, 40, 40], [0, 60, 0], [60, 0, 0],
           ];
           
-          for (const angle of angles) {
-            camera.position.set(angle.pos[0], angle.pos[1], angle.pos[2]);
+          for (const [x, y, z] of angles) {
+            camera.position.set(x, y, z);
             camera.lookAt(0, 0, 0);
             renderer.render(scene, camera);
             images.push(canvas.toDataURL('image/jpeg', 0.85));
@@ -194,11 +264,12 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
     setLoading(true);
     setError(null);
     setResults([]);
+    setUsingFallback(false);
     
     try {
-      // 1. 初始化 TensorFlow.js
-      setStatus('初始化 AI 模型...');
-      const { mobilenet } = await initTensorFlow();
+      // 1. 尝试初始化 TensorFlow.js
+      setStatus('检查 AI 模型...');
+      const tfResult = await tryInitTensorFlow();
       
       // 2. 渲染 STL 图像
       setStatus('渲染 3D 模型...');
@@ -206,59 +277,107 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
       const fetchUrl = isPrivateBlob ? `/api/get-blob?url=${encodeURIComponent(url)}` : url;
       
       const images = await renderSTLImages(fetchUrl);
-      setStatus(`已渲染 ${images.length} 个角度，分析中...`);
       
-      // 3. 分类每张图像
-      const predictions = new Map<string, number>();
+      // 3. 根据文件名提取分类
+      const filename = url.split('/').pop() || url.split('/').pop() || 'unknown.stl';
+      const filenameResults = classifyByFilename(filename.replace('.stl', '').replace('.STL', ''));
       
-      for (let i = 0; i < images.length; i++) {
-        setStatus(`分析图像 ${i + 1}/${images.length}...`);
+      // 4. 如果 TensorFlow.js 可用，进行 AI 分类
+      if (tfResult) {
+        setStatus(`已渲染 ${images.length} 个角度，AI 分析中...`);
         
-        const img = new window.Image();
-        img.crossOrigin = 'anonymous';
+        const predictions = new Map<string, number>();
         
-        await new Promise<void>((resolve) => {
-          img.onload = () => resolve();
-          img.onerror = () => resolve();
-          img.src = images[i];
-        });
-        
-        if (img.width > 0) {
-          try {
-            const preds = await mobilenet.classify(img, 5);
-            for (const p of preds) {
-              const current = predictions.get(p.className) || 0;
-              predictions.set(p.className, current + p.probability);
+        for (let i = 0; i < images.length; i++) {
+          setStatus(`AI 分析 ${i + 1}/${images.length}...`);
+          
+          const img = new window.Image();
+          img.crossOrigin = 'anonymous';
+          
+          await new Promise<void>((resolve) => {
+            img.onload = () => resolve();
+            img.onerror = () => resolve();
+            img.src = images[i];
+          });
+          
+          if (img.width > 0) {
+            try {
+              const preds = await tfResult.mobilenet.classify(img, 5);
+              for (const p of preds) {
+                const current = predictions.get(p.className) || 0;
+                predictions.set(p.className, current + p.probability);
+              }
+            } catch (e) {
+              console.warn('[STLClassifier] AI classification failed:', e);
             }
-          } catch (e) {
-            console.warn('[STLClassifier] Image classification failed:', e);
           }
         }
+        
+        // 合并 AI 结果
+        if (predictions.size > 0) {
+          const aiResults = Array.from(predictions.entries())
+            .map(([className, probability]) => ({
+              className: translate(className),
+              probability: probability / images.length,
+            }))
+            .sort((a, b) => b.probability - a.probability)
+            .slice(0, 3);
+          
+          // 合并文件名分类和 AI 分类
+          setResults(mergeResults(filenameResults, aiResults));
+        } else {
+          setResults(filenameResults);
+        }
+      } else {
+        // 使用文件名分类
+        setUsingFallback(true);
+        setStatus('使用文件名分类...');
+        setResults(filenameResults);
       }
       
-      // 4. 汇总结果
-      const sortedResults = Array.from(predictions.entries())
-        .map(([className, probability]) => ({
-          className: translate(className),
-          probability: probability / images.length,
-        }))
-        .sort((a, b) => b.probability - a.probability)
-        .slice(0, 5);
-      
-      setResults(sortedResults);
       setStatus('分类完成！');
       
       if (onClassify) {
-        onClassify(sortedResults);
+        onClassify(results.length > 0 ? results : filenameResults);
       }
     } catch (err) {
       console.error('[STLClassifier] Error:', err);
-      const errMsg = err instanceof Error ? err.message : '分类失败';
-      setError(errMsg);
+      // 发生错误时，使用文件名分类作为后备
+      const filename = url.split('/').pop() || 'unknown';
+      const fallbackResults = classifyByFilename(filename.replace('.stl', '').replace('.STL', ''));
+      setResults(fallbackResults);
+      setUsingFallback(true);
+      setStatus('分类完成（备用模式）');
     } finally {
       setLoading(false);
     }
   };
+
+  // 合并两种分类结果
+  function mergeResults(filenameResults: ClassificationResult[], aiResults: ClassificationResult[]): ClassificationResult[] {
+    const merged = new Map<string, ClassificationResult>();
+    
+    // 添加文件名分类结果
+    for (const r of filenameResults) {
+      merged.set(r.className, { ...r });
+    }
+    
+    // 合并 AI 结果
+    for (const r of aiResults) {
+      const existing = merged.get(r.className);
+      if (existing) {
+        // 取两者的平均值，提高置信度
+        existing.probability = (existing.probability + r.probability) / 2 * 1.2;
+        if (existing.probability > 1) existing.probability = 1;
+      } else {
+        merged.set(r.className, { ...r });
+      }
+    }
+    
+    return Array.from(merged.values())
+      .sort((a, b) => b.probability - a.probability)
+      .slice(0, 5);
+  }
 
   if (!isClient) {
     return (
@@ -295,6 +414,12 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
         )}
       </button>
       
+      {usingFallback && !loading && results.length > 0 && (
+        <div className="p-2 bg-yellow-50 border border-yellow-200 rounded-lg text-xs text-yellow-700">
+          💡 当前使用文件名分类（AI 模型加载失败时可正常工作）
+        </div>
+      )}
+      
       {error && (
         <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm whitespace-pre-wrap">
           ⚠️ {error}
@@ -303,7 +428,9 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
       
       {results.length > 0 && (
         <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
-          <h4 className="font-medium text-purple-800 mb-2">🎯 分类结果</h4>
+          <h4 className="font-medium text-purple-800 mb-2">
+            🎯 分类结果 {usingFallback && <span className="text-xs font-normal">(文件名分类)</span>}
+          </h4>
           <div className="space-y-2">
             {results.map((r, i) => (
               <div key={i} className="flex items-center justify-between">
@@ -318,15 +445,12 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
                     />
                   </div>
                   <span className="text-xs text-gray-500 w-10 text-right">
-                    {(r.probability * 100).toFixed(1)}%
+                    {(r.probability * 100).toFixed(0)}%
                   </span>
                 </div>
               </div>
             ))}
           </div>
-          <p className="text-xs text-gray-400 mt-2">
-            建议：使用「{results[0].className}」作为分类标签
-          </p>
         </div>
       )}
     </div>
@@ -335,115 +459,127 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
 
 // 批量分类工具函数
 export async function classifySTLModel(url: string): Promise<ClassificationResult[]> {
-  // 确保在客户端环境
   if (typeof window === 'undefined') {
     throw new Error('classifySTLModel 只能在浏览器中运行');
   }
   
-  // 初始化
-  const { mobilenet } = await initTensorFlow();
+  // 从 URL 提取文件名
+  const filename = url.split('/').pop() || url.split('/').pop() || 'unknown.stl';
+  const cleanFilename = filename.replace('.stl', '').replace('.STL', '');
   
-  // 渲染图像
-  const images = await new Promise<string[]>((resolve, reject) => {
-    const loader = new STLLoader();
-    const canvas = document.createElement('canvas');
-    canvas.width = 224;
-    canvas.height = 224;
-    
-    loader.load(
-      url,
-      (geometry) => {
-        const renderer = new THREE.WebGLRenderer({ 
-          canvas, 
-          antialias: true,
-          preserveDrawingBuffer: true,
+  // 尝试 TensorFlow.js
+  const tfResult = await tryInitTensorFlow();
+  
+  if (tfResult) {
+    try {
+      // 渲染图像
+      const images = await new Promise<string[]>((resolve, reject) => {
+        const loader = new STLLoader();
+        const canvas = document.createElement('canvas');
+        canvas.width = 224;
+        canvas.height = 224;
+        
+        loader.load(
+          url,
+          (geometry) => {
+            const renderer = new THREE.WebGLRenderer({ 
+              canvas, 
+              antialias: true,
+              preserveDrawingBuffer: true,
+            });
+            renderer.setSize(224, 224);
+            renderer.setClearColor(0x2a2a2a);
+            
+            const scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x2a2a2a);
+            
+            const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
+            
+            scene.add(new THREE.AmbientLight(0x606060, 2));
+            const light = new THREE.DirectionalLight(0xffffff, 1);
+            light.position.set(1, 1, 1);
+            scene.add(light);
+            
+            const material = new THREE.MeshPhongMaterial({
+              color: 0x00a8ff,
+              specular: 0x222222,
+              shininess: 150,
+              flatShading: true,
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            
+            geometry.computeBoundingBox();
+            const box = geometry.boundingBox!;
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            mesh.position.sub(center);
+            
+            const size = new THREE.Vector3();
+            box.getSize(size);
+            const scale = 45 / Math.max(size.x, size.y, size.z);
+            mesh.scale.set(scale, scale, scale);
+            
+            scene.add(mesh);
+            
+            const images: string[] = [];
+            const angles = [[0, 0, 60], [40, 40, 40], [-40, 40, 40]];
+            
+            for (const [x, y, z] of angles) {
+              camera.position.set(x, y, z);
+              camera.lookAt(0, 0, 0);
+              renderer.render(scene, camera);
+              images.push(canvas.toDataURL('image/jpeg', 0.85));
+            }
+            
+            renderer.dispose();
+            geometry.dispose();
+            material.dispose();
+            
+            resolve(images);
+          },
+          undefined,
+          reject
+        );
+      });
+      
+      // AI 分类
+      const predictions = new Map<string, number>();
+      
+      for (const imgData of images) {
+        const img = new window.Image();
+        img.crossOrigin = 'anonymous';
+        
+        await new Promise<void>((resolve) => {
+          img.onload = () => resolve();
+          img.onerror = () => resolve();
+          img.src = imgData;
         });
-        renderer.setSize(224, 224);
-        renderer.setClearColor(0x2a2a2a);
         
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x2a2a2a);
-        
-        const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
-        
-        scene.add(new THREE.AmbientLight(0x606060, 2));
-        const light = new THREE.DirectionalLight(0xffffff, 1);
-        light.position.set(1, 1, 1);
-        scene.add(light);
-        
-        const material = new THREE.MeshPhongMaterial({
-          color: 0x00a8ff,
-          specular: 0x222222,
-          shininess: 150,
-          flatShading: true,
-        });
-        const mesh = new THREE.Mesh(geometry, material);
-        
-        geometry.computeBoundingBox();
-        const box = geometry.boundingBox!;
-        const center = new THREE.Vector3();
-        box.getCenter(center);
-        mesh.position.sub(center);
-        
-        const size = new THREE.Vector3();
-        box.getSize(size);
-        const scale = 45 / Math.max(size.x, size.y, size.z);
-        mesh.scale.set(scale, scale, scale);
-        
-        scene.add(mesh);
-        
-        const images: string[] = [];
-        const angles = [
-          [0, 0, 60], [40, 40, 40], [-40, 40, 40], [0, 60, 0], [60, 0, 0]
-        ];
-        
-        for (const [x, y, z] of angles) {
-          camera.position.set(x, y, z);
-          camera.lookAt(0, 0, 0);
-          renderer.render(scene, camera);
-          images.push(canvas.toDataURL('image/jpeg', 0.85));
+        if (img.width > 0) {
+          try {
+            const preds = await tfResult.mobilenet.classify(img, 5);
+            for (const p of preds) {
+              const current = predictions.get(p.className) || 0;
+              predictions.set(p.className, current + p.probability);
+            }
+          } catch {}
         }
-        
-        renderer.dispose();
-        geometry.dispose();
-        material.dispose();
-        
-        resolve(images);
-      },
-      undefined,
-      reject
-    );
-  });
-  
-  // 分类
-  const predictions = new Map<string, number>();
-  
-  for (const imgData of images) {
-    const img = new window.Image();
-    img.crossOrigin = 'anonymous';
-    
-    await new Promise<void>((resolve) => {
-      img.onload = () => resolve();
-      img.onerror = () => resolve();
-      img.src = imgData;
-    });
-    
-    if (img.width > 0) {
-      try {
-        const preds = await mobilenet.classify(img, 5);
-        for (const p of preds) {
-          const current = predictions.get(p.className) || 0;
-          predictions.set(p.className, current + p.probability);
-        }
-      } catch {}
+      }
+      
+      if (predictions.size > 0) {
+        return Array.from(predictions.entries())
+          .map(([className, probability]) => ({
+            className: translate(className),
+            probability: probability / images.length,
+          }))
+          .sort((a, b) => b.probability - a.probability)
+          .slice(0, 5);
+      }
+    } catch (error) {
+      console.warn('[classifySTLModel] AI classification failed, using filename:', error);
     }
   }
   
-  return Array.from(predictions.entries())
-    .map(([className, probability]) => ({
-      className: translate(className),
-      probability: probability / images.length,
-    }))
-    .sort((a, b) => b.probability - a.probability)
-    .slice(0, 5);
+  // 后备：文件名分类
+  return classifyByFilename(cleanFilename);
 }
