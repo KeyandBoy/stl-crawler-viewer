@@ -275,13 +275,51 @@ async function crawlYeggi(keyword: string): Promise<SearchResult[]> {
   return results;
 }
 
-// ===================== 本地模型搜索 =====================
+// ===================== 本地模型搜索（支持 Vercel Blob）=====================
 async function searchLocalModels(query: string): Promise<SearchResult[]> {
+  const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
+  const USE_BLOB = !!BLOB_TOKEN;
+  const q = query.trim().toLowerCase();
+
+  // 优先使用 Vercel Blob（云端部署时）
+  if (USE_BLOB) {
+    try {
+      const { list } = await import('@vercel/blob');
+      const { blobs } = await list({
+        prefix: 'stl-models/',
+        token: BLOB_TOKEN,
+      });
+
+      const stlFiles = blobs.filter(b => b.pathname.toLowerCase().endsWith('.stl'));
+      const filtered = stlFiles.filter(f => {
+        const filename = f.pathname.split('/').pop()?.replace('.stl', '') || '';
+        return filename.toLowerCase().includes(q);
+      });
+
+      return filtered.map(f => {
+        const filename = f.pathname.split('/').pop() || '';
+        return {
+          id: `blob-${f.pathname}`,
+          title: filename.replace('.stl', ''),
+          url: f.url,
+          downloadUrl: f.url,
+          snippet: 'Vercel Blob 本地模型库',
+          siteName: '我的图书馆',
+          verifiedFree: true,
+          isLocal: true,
+        };
+      });
+    } catch (error) {
+      console.error('[searchLocalModels] Vercel Blob 查询失败:', error);
+      return [];
+    }
+  }
+
+  // 回退到本地文件（开发环境或未配置 Blob 时）
   const stlDir = path.join(process.cwd(), 'public', 'stl-models');
   try {
     if (!fs.existsSync(stlDir)) { fs.mkdirSync(stlDir, { recursive: true }); return []; }
     const files = fs.readdirSync(stlDir);
-    const q = query.trim().toLowerCase();
     const filtered = files.filter(f =>
       f.toLowerCase().endsWith('.stl') && f.replace('.stl', '').toLowerCase().includes(q)
     );
