@@ -30,7 +30,6 @@ const STL_SITES_CONFIG = [
   { name: "爱给网", searchUrl: (kw: string) => `https://www.aigei.com/s?q=${encodeURIComponent(kw)}&type=3d`, isFree: true, tag: "免费" },
   { name: "3D溜溜网", searchUrl: (kw: string) => `https://3d.3d66.com/model/${encodeURIComponent(`${kw}stl`)}_1.html?sws=1`, isFree: false, tag: "部分免费" },
   { name: "Yeggi", searchUrl: (kw: string) => `https://www.yeggi.com/q/${encodeURIComponent(kw + ' stl')}/`, isFree: true, tag: "全免费（STL聚合）" },
-  { name: "Sketchfab", searchUrl: (kw: string) => `https://sketchfab.com/search?q=${encodeURIComponent(kw + ' stl')}&type=models&sort_by=-4&file_formats=2`, isFree: false, tag: "部分免费" },
 ];
 
 // ===================== 精选模型库 =====================
@@ -276,49 +275,6 @@ async function crawlYeggi(keyword: string): Promise<SearchResult[]> {
   return results;
 }
 
-// ===================== Sketchfab 爬取 =====================
-async function crawlSketchfab(keyword: string): Promise<SearchResult[]> {
-  const results: SearchResult[] = [];
-  const html = await fetchPage(`https://sketchfab.com/search?q=${encodeURIComponent(keyword + ' stl')}&type=models&sort_by=-4&file_formats=2`);
-  
-  if (html) {
-    const $ = cheerio.load(html);
-    const seen = new Set<string>();
-    
-    // Sketchfab 模型链接格式：/3d-models/xxx 或模型页面链接
-    $('a[href*="/3d-models/"]').each((i, el) => {
-      if (results.length >= MAX_PER_SITE) return false;
-      
-      const href = $(el).attr('href') || '';
-      if (!href || seen.has(href)) return;
-      
-      // 跳过搜索页面本身
-      if (href === '/search') return;
-      
-      const title = $(el).find('[class*="title"], .name, h3').first().text().trim()
-        || $(el).attr('title')
-        || $(el).text().trim().split('\n')[0].trim();
-      
-      if (!title || title.length < 3 || isGarbage(title, '')) return;
-      
-      seen.add(href);
-      const modelUrl = `https://sketchfab.com${href}`;
-      
-      results.push({
-        id: `sketchfab-${i}-${Date.now()}`,
-        title: title.substring(0, 100),
-        url: modelUrl,
-        downloadUrl: modelUrl,
-        snippet: `Sketchfab：${title}，点击进入详情页下载`,
-        siteName: 'Sketchfab',
-        verifiedFree: false, // Sketchfab 部分免费，需要跳转确认
-      });
-    });
-  }
-  
-  return results;
-}
-
 // ===================== 本地模型搜索（支持 Vercel Blob）=====================
 async function searchLocalModels(query: string): Promise<SearchResult[]> {
   const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
@@ -399,24 +355,22 @@ export async function POST(request: NextRequest) {
     const expandedKw = expandKeyword(keyword);
 
     // 并行爬取所有来源
-    const [localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, sketchfabResults, siteLinks] = await Promise.all([
+    const [localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, siteLinks] = await Promise.all([
       searchLocalModels(keyword),
       Promise.resolve(searchCuratedModels(keyword || expandedKw)),
       crawlThingiverse(expandedKw).catch(() => []),
       crawlAigei(expandedKw).catch(() => []),
       crawlYeggi(expandedKw).catch(() => []),
-      crawlSketchfab(expandedKw).catch(() => []),
       Promise.resolve(crawlSTLSites(keyword)),
     ]);
 
-    // 合并：本地 > 精选库 > Thingiverse > 爱给网 > Yeggi > Sketchfab > 站点跳转
+    // 合并：本地 > 精选库 > Thingiverse > 爱给网 > Yeggi > 站点跳转
     const merged = dedup(
       localResults,
       curatedResults,
       thingiverseResults,
       aigeiResults,
       yeggiResults,
-      sketchfabResults,
       siteLinks
     ).slice(0, count);
 
@@ -429,7 +383,7 @@ export async function POST(request: NextRequest) {
       hasResult: hasReal || merged.length > 0,
       emptyTip: hasReal ? '' : '未找到有效模型，可点击下方推荐站点跳转',
       curatedCount: curatedResults.length,
-      crawledCount: thingiverseResults.length + aigeiResults.length + yeggiResults.length + sketchfabResults.length,
+      crawledCount: thingiverseResults.length + aigeiResults.length + yeggiResults.length,
     });
   } catch (error) {
     console.error('[search-stl] POST 错误:', error);
@@ -442,17 +396,16 @@ export async function GET(request: NextRequest) {
   const keyword = request.nextUrl.searchParams.get('keyword') || request.nextUrl.searchParams.get('query') || '';
   const expandedKw = expandKeyword(keyword);
 
-  const [localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, sketchfabResults, siteLinks] = await Promise.all([
+  const [localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, siteLinks] = await Promise.all([
     searchLocalModels(keyword),
     Promise.resolve(searchCuratedModels(keyword || expandedKw)),
     crawlThingiverse(expandedKw).catch(() => []),
     crawlAigei(expandedKw).catch(() => []),
     crawlYeggi(expandedKw).catch(() => []),
-    crawlSketchfab(expandedKw).catch(() => []),
     Promise.resolve(crawlSTLSites(keyword)),
   ]);
 
-  const merged = dedup(localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, sketchfabResults, siteLinks).slice(0, 30);
+  const merged = dedup(localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, siteLinks).slice(0, 30);
   const hasReal = merged.some(r => r.downloadUrl && !r.isRecommendedSite);
 
   return NextResponse.json({
