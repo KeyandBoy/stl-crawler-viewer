@@ -42,3 +42,13 @@ next-env.d.ts
 
 # local STL model files (use Vercel Blob in production)
 /public/stl-models/
+
+# local site cookies / sensitive config
+/data/
+
+# browser agent dependencies and local runtime output
+/browser-agent/node_modules/
+/browser-agent/.playwright/
+/dev-server.log
+/test-results.log
+/test-log-v2.txt

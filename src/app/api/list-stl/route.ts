@@ -1,6 +1,7 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
+import { canEditSuffix, canSeeItem, isAdminKey, makeDisplayFilename, readLibraryMetadata, type LibraryItemMeta } from '@/lib/libraryMetadata';
 
 const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
 const USE_BLOB = !!BLOB_TOKEN;
@@ -42,8 +43,35 @@ function getAllSTLFiles(dir: string, baseDir: string): Array<{ key: string; url:
   return results;
 }
 
-export async function GET() {
+function toClientFile(meta: LibraryItemMeta, ownerToken: string | null, adminKey: string | null) {
+  const admin = isAdminKey(adminKey);
+  return {
+    key: meta.key,
+    url: meta.url,
+    filename: makeDisplayFilename(meta),
+    originalFilename: meta.originalFilename,
+    suffix: meta.suffix,
+    prefix: meta.prefix,
+    status: meta.status,
+    canRenameSuffix: canEditSuffix(meta, ownerToken) || admin,
+    canDelete: admin,
+    canSetPrefix: admin,
+    createdAt: meta.createdAt,
+    category: meta.category,
+    displayName: meta.displayName,
+    thumbnailUrl: meta.thumbnailUrl,
+  };
+}
+
+export async function GET(request: NextRequest) {
   try {
+    const ownerToken = request.headers.get('x-owner-token');
+    const adminKey = request.headers.get('x-admin-key');
+    const metadata = await readLibraryMetadata();
+    const visibleMeta = metadata.items
+      .filter(item => canSeeItem(item, ownerToken, adminKey))
+      .map(item => toClientFile(item, ownerToken, adminKey));
+
     if (USE_BLOB) {
       const { list } = await import('@vercel/blob');
       const { blobs } = await list({ 
@@ -51,14 +79,21 @@ export async function GET() {
         token: BLOB_TOKEN,
       });
       
-      const stlFiles = blobs
+      const knownKeys = new Set(metadata.items.map(item => item.key));
+      const orphanFiles = blobs
         .filter(b => b.pathname.toLowerCase().endsWith('.stl'))
+        .filter(b => !knownKeys.has(b.pathname.replace('stl-models/', '')))
         .map(b => ({
           key: b.pathname.replace('stl-models/', ''),
           url: b.url,
           filename: b.pathname.split('/').pop() || '',
+          status: 'approved',
+          canRenameSuffix: false,
+          canDelete: isAdminKey(adminKey),
+          canSetPrefix: isAdminKey(adminKey),
         }));
-      
+      const stlFiles = [...visibleMeta, ...orphanFiles];
+
       console.log('[list-stl] Found', stlFiles.length, 'files in Vercel Blob');
       return NextResponse.json({ success: true, files: stlFiles, total: stlFiles.length });
     }
@@ -69,7 +104,19 @@ export async function GET() {
       fs.mkdirSync(STORAGE_DIR, { recursive: true });
     }
     
-    const files = getAllSTLFiles(STORAGE_DIR, STORAGE_DIR);
+    const knownKeys = new Set(metadata.items.map(item => item.key));
+    const files = [
+      ...visibleMeta,
+      ...getAllSTLFiles(STORAGE_DIR, STORAGE_DIR)
+        .filter(file => !knownKeys.has(file.key))
+        .map(file => ({
+          ...file,
+          status: 'approved',
+          canRenameSuffix: false,
+          canDelete: isAdminKey(adminKey),
+          canSetPrefix: isAdminKey(adminKey),
+        })),
+    ];
     console.log('[list-stl] Found', files.length, 'local files (including subfolders)');
     
     return NextResponse.json({ success: true, files, total: files.length });

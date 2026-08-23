@@ -1,15 +1,17 @@
-import { NextRequest, NextResponse } from 'next/server';
+﻿import { NextRequest, NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import axios from 'axios';
 import * as cheerio from 'cheerio';
+import { crawlRequest } from '@/lib/crawler/http';
+import { parseAigeiSearch } from '@/lib/crawler/sites';
+import { search3d66 } from '@/lib/crawler/3d66';
+import { makeDisplayFilename, readLibraryMetadata } from '@/lib/libraryMetadata';
+import { getKeywordVariants, sitePrefersEnglish } from '@/lib/providers/keywords';
+import { getSearchableProviders } from '@/lib/providers/registry';
+import { resultPriority } from '@/lib/libraryRules';
+import type { ModelSearchResult } from '@/lib/providers/types';
 
-// ===================== 常量 =====================
-const FETCH_TIMEOUT = 10000;
-const MAX_PER_SITE = 6;
-
-// ===================== 类型定义 =====================
-interface SearchResult {
+export interface SearchResult {
   id: string;
   title: string;
   url: string;
@@ -17,74 +19,35 @@ interface SearchResult {
   snippet: string;
   siteName: string;
   verifiedFree: boolean;
+  resultKind?: 'model' | 'search_suggestion' | 'tip';
   isRecommendedSite?: boolean;
   isLocal?: boolean;
   isTip?: boolean;
   thumbnail?: string;
   publishTime?: string;
+  downloadMode?: 'direct' | 'detail' | 'login_required' | 'external_search' | 'paid' | 'resolve';
+  requiresLogin?: boolean;
+  canDirectDownload?: boolean;
+  downloadHint?: string;
+  sourceDetailUrl?: string;
+  sourceSearchUrl?: string;
+  isRealDetailPage?: boolean;
+  siteId?: string;
 }
 
-// ===================== 站点配置 =====================
-const STL_SITES_CONFIG = [
-  { name: "Thingiverse", searchUrl: (kw: string) => `https://www.thingiverse.com/search?q=${encodeURIComponent(kw)}`, isFree: true, tag: "免费" },
-  { name: "爱给网", searchUrl: (kw: string) => `https://www.aigei.com/s?q=${encodeURIComponent(kw)}&type=3d`, isFree: true, tag: "免费" },
-  { name: "3D溜溜网", searchUrl: (kw: string) => `https://3d.3d66.com/model/${encodeURIComponent(`${kw}stl`)}_1.html?sws=1`, isFree: false, tag: "部分免费" },
-  { name: "Yeggi", searchUrl: (kw: string) => `https://www.yeggi.com/q/${encodeURIComponent(kw + ' stl')}/`, isFree: true, tag: "全免费（STL聚合）" },
-];
-
-// ===================== 精选模型库 =====================
-const CURATED_MODELS = [
-  { title: '古典中式凉亭 STL', siteName: 'Thingiverse', searchUrl: 'https://www.thingiverse.com/thing:4821', realDownloadUrl: 'https://www.thingiverse.com/thing:4821/zip', snippet: '经典古建筑凉亭，高精度，适合3D打印', verifiedFree: true, category: ['亭子','凉亭','园林'] },
-  { title: 'Chinese Ancient House STL', siteName: 'Thingiverse', searchUrl: 'https://www.thingiverse.com/thing:34567', realDownloadUrl: 'https://www.thingiverse.com/thing:34567/zip', snippet: '中式古民居模型，还原传统建筑结构', verifiedFree: true, category: ['民居','房子','古建筑'] },
-  { title: 'Chinese Bridge STL Model', siteName: 'Thingiverse', searchUrl: 'https://www.thingiverse.com/thing:15821', realDownloadUrl: 'https://www.thingiverse.com/thing:15821/zip', snippet: '石拱桥模型，拱形结构细节', verifiedFree: true, category: ['桥','石桥'] },
-  { title: '古建筑牌坊 STL', siteName: 'Thingiverse', searchUrl: 'https://www.thingiverse.com/thing:28901', realDownloadUrl: 'https://www.thingiverse.com/thing:28901/zip', snippet: '古建筑牌坊模型，高精度', verifiedFree: true, category: ['牌坊','门楼'] },
-  { title: '应县木塔 STL 榫卯结构', siteName: 'Thingiverse', searchUrl: 'https://www.thingiverse.com/thing:41023', realDownloadUrl: 'https://www.thingiverse.com/thing:41023/zip', snippet: '应县木塔1:50复刻，完整榫卯结构', verifiedFree: true, category: ['塔','木塔','榫卯'] },
-  { title: 'Chinese Dragon Statue STL', siteName: 'Thingiverse', searchUrl: 'https://www.thingiverse.com/thing:50192', realDownloadUrl: 'https://www.thingiverse.com/thing:50192/zip', snippet: '中国龙造型雕塑STL，高精度', verifiedFree: true, category: ['龙','雕塑'] },
-  { title: 'Chinese Temple STL', siteName: 'Thingiverse', searchUrl: 'https://www.thingiverse.com/thing:37890', realDownloadUrl: 'https://www.thingiverse.com/thing:37890/zip', snippet: '中国古寺庙3D模型，高精度', verifiedFree: true, category: ['庙','寺庙','古建筑'] },
-  { title: 'Chinese Palace STL', siteName: 'Thingiverse', searchUrl: 'https://www.thingiverse.com/thing:61234', realDownloadUrl: 'https://www.thingiverse.com/thing:61234/zip', snippet: '中国古宫殿模型，斗拱飞檐细节', verifiedFree: true, category: ['殿','宫殿','皇家'] },
-  { title: '六角亭 STL Printables', siteName: 'Printables', searchUrl: 'https://www.printables.com/model/168763-chinese-hexagonal-pavilion', realDownloadUrl: 'https://www.printables.com/model/168763-chinese-hexagonal-pavilion/files', snippet: '中式六角亭3D模型，精确还原古建筑结构', verifiedFree: true, category: ['亭子','六角亭','园林'] },
-  { title: 'Chinese Traditional House STL', siteName: 'Printables', searchUrl: 'https://www.printables.com/model/220891-chinese-traditional-house', realDownloadUrl: 'https://www.printables.com/model/220891-chinese-traditional-house/files', snippet: '传统中式民居3D模型', verifiedFree: true, category: ['民居','房子','传统'] },
-  { title: 'Ancient Stone Bridge STL', siteName: 'Printables', searchUrl: 'https://www.printables.com/model/189456-ancient-stone-bridge', realDownloadUrl: 'https://www.printables.com/model/189456-ancient-stone-bridge/files', snippet: '古石拱桥模型，榫卯结构', verifiedFree: true, category: ['桥','石桥','古建筑'] },
-  { title: 'Chinese Pagoda STL', siteName: 'Printables', searchUrl: 'https://www.printables.com/model/301234-ancient-chinese-pagoda', realDownloadUrl: 'https://www.printables.com/model/301234-ancient-chinese-pagoda/files', snippet: '中国古塔3D打印模型', verifiedFree: true, category: ['塔','古建筑'] },
-  { title: '中式六角亭 STL 爱给网', siteName: '爱给网', searchUrl: 'https://www.aigei.com/3d/print/chinese-hexagonal-pavilion-stl-model', realDownloadUrl: 'https://www.aigei.com/3d/print/chinese-hexagonal-pavilion-stl-model', snippet: '传统中式六角亭，带翘角飞檐细节', verifiedFree: true, category: ['亭子','六角亭','园林'] },
-  { title: '中式廊桥 STL 爱给网', siteName: '爱给网', searchUrl: 'https://www.aigei.com/3d/print/chinese-covered-bridge-stl-model', realDownloadUrl: 'https://www.aigei.com/3d/print/chinese-covered-bridge-stl-model', snippet: '江南风格廊桥，包含桥屋、栏杆、台阶等细节', verifiedFree: true, category: ['桥','廊桥','园林'] },
-  { title: '北京四合院 STL 爱给网', siteName: '爱给网', searchUrl: 'https://www.aigei.com/3d/print/beijing-sihuyuan-main-house-stl', realDownloadUrl: 'https://www.aigei.com/3d/print/beijing-sihuyuan-main-house-stl', snippet: '北京四合院正房三维模型，1:50比例', verifiedFree: true, category: ['房子','四合院','院','民居'] },
-  { title: '徽派民居马头墙 STL', siteName: '爱给网', searchUrl: 'https://www.aigei.com/3d/print/huizhou-dwelling-horse-head-wall-stl', realDownloadUrl: 'https://www.aigei.com/3d/print/huizhou-dwelling-horse-head-wall-stl', snippet: '徽派传统民居，还原马头墙、天井等特色', verifiedFree: true, category: ['民居','房子','徽派','墙'] },
-  { title: '中式石牌坊 STL', siteName: '爱给网', searchUrl: 'https://www.aigei.com/3d/print/chinese-stone-archway-three-door-stl', realDownloadUrl: 'https://www.aigei.com/3d/print/chinese-stone-archway-three-door-stl', snippet: '三门石牌坊，含立柱、横梁、浮雕细节', verifiedFree: true, category: ['牌坊','门楼'] },
-  { title: '中式宝塔 STL 爱给网', siteName: '爱给网', searchUrl: 'https://www.aigei.com/3d/print/chinese-pagoda-stl-model-ancient', realDownloadUrl: 'https://www.aigei.com/3d/print/chinese-pagoda-stl-model-ancient', snippet: '中式多层级宝塔，带飞檐翘角', verifiedFree: true, category: ['塔','古建筑'] },
-  { title: '中式古戏台 STL', siteName: '爱给网', searchUrl: 'https://www.aigei.com/3d/print/chinese-ancient-opera-stage-stl', realDownloadUrl: 'https://www.aigei.com/3d/print/chinese-ancient-opera-stage-stl', snippet: '中式古戏台，带雕花栏杆和翘角飞檐', verifiedFree: true, category: ['戏台','台','古建筑'] },
-  { title: '龙纹石雕 STL', siteName: '爱给网', searchUrl: 'https://www.aigei.com/3d/print/dragon-carving-stone-stl', realDownloadUrl: 'https://www.aigei.com/3d/print/dragon-carving-stone-stl', snippet: '中国传统龙纹石雕，适合古建筑装饰', verifiedFree: true, category: ['龙','装饰','古建筑'] },
-  { title: 'Yeggi 中式建筑聚合', siteName: 'Yeggi', searchUrl: 'https://www.yeggi.com/q/chinese+architecture+stl/', realDownloadUrl: 'https://www.yeggi.com/q/chinese+architecture+stl/', snippet: 'Yeggi聚合中式古建筑STL，涵盖亭/塔/桥/牌坊全品类', verifiedFree: true, category: ['古建筑','亭子','塔','桥'] },
-];
-
-// ===================== 关键词语义扩展 =====================
-const KEYWORD_EXPANSION: Record<string, string[]> = {
-  '龙':   ['龙','龙纹','龙雕','螭龙','dragon'],
-  '房屋': ['房屋','房子','住宅','民居','四合院','民房','house'],
-  '亭子': ['亭子','亭台','凉亭','六角亭','八角亭','木亭','石亭','pavilion'],
-  '塔':   ['塔','佛塔','宝塔','木塔','砖塔','石塔','雁塔','雷峰塔','pagoda'],
-  '桥':   ['桥','石桥','木桥','廊桥','石拱桥','风雨桥','索桥','bridge'],
-  '牌坊': ['牌坊','牌楼','石牌坊','木牌坊','功德坊','archway'],
-  '殿':   ['殿','大殿','宫殿','佛殿','大雄宝殿','金銮殿','palace'],
-  '庙':   ['庙','寺庙','道观','文庙','城隍庙','土地庙','temple'],
-  '祠':   ['祠','宗祠','祠堂','家祠','祖祠'],
-  '院':   ['院','庭院','宅院','四合院','书院'],
-  '宅':   ['宅','住宅','民居','民宅','豪宅'],
-  '园林': ['园林','花园','园林建筑','亭园','garden'],
-  '戏台': ['戏台','古戏台','戏曲台'],
-  '门楼': ['门楼','大门','宅门','城门','gate'],
-  '台':   ['台','楼台','亭台','观星台','烽火台'],
-};
-
-function expandKeyword(kw: string): string {
-  const k = kw.toLowerCase();
-  for (const [key, aliases] of Object.entries(KEYWORD_EXPANSION)) {
-    if (aliases.some(a => k.includes(a.toLowerCase()) || a.toLowerCase().includes(k))) return key;
+function buildSiteSearchUrl(siteName: string, keyword: string): string {
+  const kw = encodeURIComponent(`${keyword} stl`);
+  switch (siteName) {
+    case '爱给网': return `https://www.aigei.com/s?q=${kw}&type=3d`;
+    case '3D溜溜网': return `https://3d.3d66.com/model/${kw}_1.html?sws=1`;
+    case 'Yeggi': return `https://www.yeggi.com/q/${kw}/`;
+    case 'Thingiverse': return `https://www.thingiverse.com/search?q=${kw}&type=things&sort=relevant`;
+    case 'Printables': return `https://www.printables.com/search/models?q=${kw}`;
+    case 'Sketchfab': return `https://sketchfab.com/search?q=${kw}&type=models`;
+    default: return '';
   }
-  return kw;
 }
 
-// ===================== 黑名单过滤 =====================
 const GARBAGE_PATTERNS = [
   /作品上传|上传声明|版权声明|用户声明|签约设计师|设计师入驻/i,
   /下载声明|关于本站|联系我们|常见问题|帮助中心|意见反馈/i,
@@ -92,251 +55,171 @@ const GARBAGE_PATTERNS = [
   /Copyright|All Rights Reserved|沪ICP备|京ICP备|粤ICP备/i,
   /分类目录|标签聚合|专题推荐|热门下载|编辑精选|排行榜/i,
 ];
-
-const MODEL_HINTS = [
-  'stl','模型','model','3d','打印','print','下载',
-  '亭','塔','桥','楼','屋','房','殿','庙','祠','台','门','坊','廊','院','宅','园','馆','阁',
-  '龙','瓦','砖','榫卯','飞檐','斗拱','雕花','古建筑','民居','dragon','pavilion','pagoda','bridge','temple',
-];
-
-function isGarbage(title: string, snippet: string, url?: string): boolean {
+function isGarbage(title: string, snippet: string): boolean {
   const text = `${title} ${snippet}`.toLowerCase();
-  if (GARBAGE_PATTERNS.some(p => p.test(text))) return true;
-  if (url && GARBAGE_PATTERNS.some(p => p.test(url))) return true;
-  if (!MODEL_HINTS.some(h => text.includes(h)) && text.length < 15) return true;
-  return false;
+  return GARBAGE_PATTERNS.some(p => p.test(text));
+}
+function providerToFrontend(r: ModelSearchResult): SearchResult {
+  const siteNameMap: Record<string, string> = { thingiverse: 'Thingiverse', printables: 'Printables' };
+  const siteName = siteNameMap[r.provider] || r.provider;
+  let downloadMode: SearchResult['downloadMode'];
+  if (r.downloadCapability === 'direct_file') downloadMode = 'direct';
+  else if (r.downloadCapability === 'resolve_detail') downloadMode = 'resolve';
+  else if (r.downloadCapability === 'browser_click') downloadMode = 'login_required';
+  else downloadMode = 'external_search';
+  return {
+    id: r.id, title: r.title, url: r.detailUrl || r.searchUrl || '',
+    downloadUrl: r.files?.[0]?.url, snippet: r.description || '', siteName,
+    verifiedFree: r.access === 'free', resultKind: r.resultKind, thumbnail: r.thumbnail,
+    downloadMode, requiresLogin: r.requiresLogin,
+    canDirectDownload: r.resolution === 'resolved' && !!r.files?.length,
+    downloadHint: r.resolution === 'resolved' ? `${siteName} 已解析到 ${r.files?.length || 0} 个文件` : undefined,
+    sourceDetailUrl: r.detailUrl, sourceSearchUrl: r.searchUrl,
+    isRealDetailPage: r.resultKind === 'model', siteId: r.provider,
+  };
 }
 
-// ===================== 网络请求工具 =====================
-async function fetchPage(url: string): Promise<string | null> {
+async function searchViaProviders(keyword: string, maxResults: number, hasAgentToken = false): Promise<SearchResult[]> {
+  const providers = getSearchableProviders();
+  // 无 Agent Token 时跳过 HTTP 必失败的站点（Thingiverse 是 React SPA、Printables 被 Cloudflare 拦截）
+  const filtered = hasAgentToken ? providers : providers.filter(p => !['thingiverse', 'printables'].includes(p.id));
+  if (filtered.length === 0) return [];
+  console.log(`[provider] 开始搜索 keyword="${keyword}" providers=${filtered.map(p=>p.id).join(',')}`);
+  const tasks = filtered.map(async (provider) => {
+    const preferEn = sitePrefersEnglish(provider.id);
+    const variants = getKeywordVariants(keyword, preferEn).slice(0, 3);
+    try {
+      const providerResults = await provider.search({ keyword, variants, maxResults: Math.min(maxResults, 6), timeout: 12000 });
+      console.log(`[provider:${provider.id}] 返回 ${providerResults.length} 条`);
+      return providerResults.map(providerToFrontend);
+    } catch (e) {
+      console.error(`[provider:${provider.id}] 搜索失败:`, e instanceof Error ? e.message : e);
+      return [] as SearchResult[];
+    }
+  });
+  const all = await Promise.all(tasks);
+  return all.flat();
+}
+
+async function search3D66Legacy(keyword: string): Promise<SearchResult[]> {
   try {
-    const resp = await axios.get(url, {
-      timeout: FETCH_TIMEOUT,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      },
-      maxRedirects: 5,
-    });
-    const ct = (resp.headers['content-type'] || '') as string;
-    if (!ct.includes('html') && !ct.includes('json')) return null;
-    return resp.data as string;
-  } catch { return null; }
+    console.log(`[3d66] 搜索 keyword="${keyword}"`);
+    const hits = await search3d66(keyword);
+    console.log(`[3d66] 返回 ${hits.length} 条`);
+    return hits.slice(0, 6).map((hit, i) => ({
+      id: hit.id || `3d66-${i}-${Date.now()}`, title: hit.title, url: hit.detailUrl,
+      snippet: `3D溜溜网：${hit.title}`, siteName: '3D溜溜网', verifiedFree: false,
+      resultKind: 'model' as const, downloadMode: 'paid' as const,
+      downloadHint: '付费模型，点击跳转原站', sourceDetailUrl: hit.detailUrl,
+      sourceSearchUrl: hit.detailUrl, isRealDetailPage: true, siteId: '3d66',
+    }));
+  } catch { return []; }
 }
 
-// ===================== 精选库检索 =====================
-function searchCuratedModels(query: string): SearchResult[] {
-  const q = query.toLowerCase().trim();
-  const matched = q 
-    ? CURATED_MODELS.filter(m =>
-        m.title.toLowerCase().includes(q) ||
-        m.snippet.toLowerCase().includes(q) ||
-        m.category.some(c => q.includes(c) || c.includes(q))
-      )
-    : CURATED_MODELS.slice(0, 10);
-
-  return matched.map((m, i) => ({
-    id: `curated-${i}-${Date.now()}`,
-    title: m.title,
-    url: m.searchUrl,
-    downloadUrl: m.realDownloadUrl,
-    snippet: m.snippet,
-    siteName: m.siteName,
-    verifiedFree: m.verifiedFree,
-  }));
-}
-
-// ===================== 站点跳转链接（兜底）=====================
-function crawlSTLSites(keyword: string): SearchResult[] {
-  return STL_SITES_CONFIG.map((site, index) => ({
-    id: `crawl-${index}-${keyword}`,
-    title: `${keyword}相关STL模型 - ${site.name}`,
-    url: site.searchUrl(keyword),
-    snippet: `${site.tag} ${site.name}：海量${keyword}相关建筑STL模型`,
-    siteName: site.name,
-    verifiedFree: site.isFree,
-    isRecommendedSite: true,
-  }));
-}
-
-// ===================== Thingiverse 爬取 =====================
-async function crawlThingiverse(keyword: string): Promise<SearchResult[]> {
-  const results: SearchResult[] = [];
-  const html = await fetchPage(`https://www.thingiverse.com/search?q=${encodeURIComponent(keyword)}&type=things&sort=relevant`);
-  
-  if (html) {
-    const $ = cheerio.load(html);
-    const seen = new Set<string>();
-    
-    $('a[href*="/thing:"]').each((i, el) => {
-      if (results.length >= MAX_PER_SITE) return false;
-      
-      const href = $(el).attr('href') || '';
-      const thingId = href.match(/thing:(\d+)/)?.[1];
-      if (!thingId || seen.has(thingId)) return;
-      
-      const title = $(el).find('[class*="title"], h3, h4').first().text().trim()
-        || $(el).attr('title')
-        || $(el).text().trim().split('\n')[0].trim();
-      
-      if (!title || title.length < 3 || isGarbage(title, '')) return;
-      
-      seen.add(thingId);
-      results.push({
-        id: `thingiverse-${thingId}`,
-        title: title.substring(0, 100),
-        url: `https://www.thingiverse.com/thing:${thingId}`,
-        downloadUrl: `https://www.thingiverse.com/thing:${thingId}/zip`,
-        snippet: `Thingiverse：${title}，免费STL，可一键下载全部文件`,
-        siteName: 'Thingiverse',
-        verifiedFree: true,
-      });
-    });
+async function searchAigeiLegacy(keyword: string): Promise<SearchResult[]> {
+  try {
+    console.log(`[aigei] 搜索 keyword="${keyword}"`);
+    const url = `https://www.aigei.com/s?q=${encodeURIComponent(keyword)}&type=3d`;
+    const { data, status } = await crawlRequest(url, 'aigei', { maxRetries: 0, timeout: 6000 });
+    console.log(`[aigei] status=${status} dataLen=${typeof data === 'string' ? data.length : 'N/A'}`);
+    if (status >= 400 || typeof data !== 'string') return [];
+    const parsed = parseAigeiSearch(String(data));
+    console.log(`[aigei] 解析到 ${parsed.length} 条`);
+    return parsed.slice(0, 6).map(hit => ({
+      id: hit.id, title: hit.title, url: hit.detailUrl, snippet: `爱给网：${hit.title}`,
+      siteName: '爱给网', verifiedFree: false, resultKind: 'model' as const,
+      downloadMode: 'resolve' as const, downloadHint: '点击后自动解析详情页',
+      sourceDetailUrl: hit.detailUrl, sourceSearchUrl: url, isRealDetailPage: true, siteId: 'aigei',
+    }));
+  } catch (e) {
+    console.error(`[aigei] 搜索异常 keyword="${keyword}":`, e instanceof Error ? e.message : e);
+    return [];
   }
-  
-  return results;
 }
 
-// ===================== 爱给网爬取 =====================
-async function crawlAigei(keyword: string): Promise<SearchResult[]> {
+async function searchYeggiLegacy(keyword: string): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
-  const html = await fetchPage(`https://www.aigei.com/s?q=${encodeURIComponent(keyword)}&type=3d`);
-  
-  if (html) {
-    const $ = cheerio.load(html);
+  try {
+    const url = `https://www.yeggi.com/q/${encodeURIComponent(keyword + ' stl')}/`;
+    console.log(`[yeggi] 搜索 url="${url}"`);
+    const { data, status } = await crawlRequest(url, 'yeggi', { maxRetries: 0, timeout: 6000 });
+    console.log(`[yeggi] status=${status} dataLen=${typeof data === 'string' ? data.length : 'N/A'}`);
+    if (status >= 400 || typeof data !== 'string') return results;
+    const $ = cheerio.load(data);
     const seen = new Set<string>();
-    
-    $('a[href*="/3d/print/"]').each((i, el) => {
-      if (results.length >= MAX_PER_SITE) return false;
-      
-      const href = $(el).attr('href') || '';
-      if (seen.has(href)) return;
-      
-      const title = $(el).find('[class*="title"], h3, h4, .name').first().text().trim()
-        || $(el).attr('title')
-        || $(el).text().trim().split('\n')[0].trim();
-      
-      if (!title || title.length < 3 || isGarbage(title, '')) return;
-      
-      seen.add(href);
-      const modelUrl = href.startsWith('http') ? href : `https://www.aigei.com${href}`;
-      
-      results.push({
-        id: `aigei-${i}-${Date.now()}`,
-        title: title.substring(0, 100),
-        url: modelUrl,
-        downloadUrl: modelUrl,
-        snippet: `爱给网：${title}，STL模型，点击进入详情页下载`,
-        siteName: '爱给网',
-        verifiedFree: true,
-      });
-    });
-  }
-  
-  return results;
-}
-
-// ===================== Yeggi 爬取 =====================
-async function crawlYeggi(keyword: string): Promise<SearchResult[]> {
-  const results: SearchResult[] = [];
-  const html = await fetchPage(`https://www.yeggi.com/q/${encodeURIComponent(keyword + ' stl')}/`);
-  
-  if (html) {
-    const $ = cheerio.load(html);
-    const seen = new Set<string>();
-    
     $('a[href*="/model/"], a[href*="thingiverse"], a[href*="printables"], a[href*="cults"]').each((i, el) => {
-      if (results.length >= MAX_PER_SITE) return false;
-      
+      if (results.length >= 6) return false;
       const href = $(el).attr('href') || '';
       if (seen.has(href) || !href) return;
-      
       const title = $(el).find('h3, [class*="title"], [class*="name"]').first().text().trim()
         || $(el).text().trim().split('\n')[0].trim();
-      
       if (!title || title.length < 3 || isGarbage(title, '')) return;
-      
       seen.add(href);
       const modelUrl = href.startsWith('http') ? href : `https://www.yeggi.com${href}`;
-      
       results.push({
-        id: `yeggi-${i}-${Date.now()}`,
-        title: title.substring(0, 100),
+        id: `yeggi-${i}-${Date.now()}`, title: title.substring(0, 100),
         url: `https://www.yeggi.com/q/${encodeURIComponent(keyword + ' stl')}/`,
-        downloadUrl: modelUrl,
-        snippet: `Yeggi聚合：${title}，点击跳转原站下载`,
-        siteName: 'Yeggi',
-        verifiedFree: true,
+        downloadUrl: modelUrl, snippet: `Yeggi聚合：${title}`, siteName: 'Yeggi',
+        verifiedFree: false, resultKind: 'search_suggestion', downloadMode: 'external_search',
+        sourceSearchUrl: modelUrl, sourceDetailUrl: modelUrl, siteId: 'yeggi',
       });
     });
+  } catch (e) {
+    console.error(`[yeggi] 搜索异常 keyword="${keyword}":`, e instanceof Error ? e.message : e);
   }
-  
   return results;
 }
-
-// ===================== 本地模型搜索（支持 Vercel Blob）=====================
 async function searchLocalModels(query: string): Promise<SearchResult[]> {
   const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
   const USE_BLOB = !!BLOB_TOKEN;
   const q = query.trim().toLowerCase();
 
-  // 优先使用 Vercel Blob（云端部署时）
   if (USE_BLOB) {
     try {
       const { list } = await import('@vercel/blob');
-      const { blobs } = await list({
-        prefix: 'stl-models/',
-        token: BLOB_TOKEN,
-      });
-
-      const stlFiles = blobs.filter(b => b.pathname.toLowerCase().endsWith('.stl'));
-      const filtered = stlFiles.filter(f => {
-        const filename = f.pathname.split('/').pop()?.replace('.stl', '') || '';
-        return filename.toLowerCase().includes(q);
-      });
-
-      return filtered.map(f => {
-        const filename = f.pathname.split('/').pop() || '';
+      const metadata = await readLibraryMetadata();
+      const metaByKey = new Map(metadata.items.filter(i => i.status === 'approved').map(i => [i.key, i]));
+      const { blobs } = await list({ prefix: 'stl-models/', token: BLOB_TOKEN });
+      return blobs.filter(b => b.pathname.toLowerCase().endsWith('.stl')).filter(f => {
+        const key = f.pathname.replace('stl-models/', '');
+        const name = (metaByKey.get(key) ? makeDisplayFilename(metaByKey.get(key)!) : f.pathname.split('/').pop() || '').replace(/\.stl$/i, '');
+        return name.toLowerCase().includes(q);
+      }).map(f => {
+        const key = f.pathname.replace('stl-models/', '');
+        const meta = metaByKey.get(key);
+        const filename = meta ? makeDisplayFilename(meta) : f.pathname.split('/').pop() || '';
         return {
-          id: `blob-${f.pathname}`,
-          title: filename.replace('.stl', ''),
-          url: f.url,
-          downloadUrl: f.url,
-          snippet: 'Vercel Blob 本地模型库',
-          siteName: '我的图书馆',
-          verifiedFree: true,
-          isLocal: true,
+          id: `blob-${key}`, title: filename.replace('.stl', ''), url: f.url, downloadUrl: f.url,
+          snippet: 'Vercel Blob 本地模型库', siteName: '我的图书馆', verifiedFree: true,
+          resultKind: 'model' as const, isLocal: true, isRealDetailPage: false,
+          downloadMode: 'direct' as const, canDirectDownload: true, downloadHint: '本地模型，可直接下载',
         };
       });
-    } catch (error) {
-      console.error('[searchLocalModels] Vercel Blob 查询失败:', error);
-      return [];
-    }
+    } catch { return []; }
   }
 
-  // 回退到本地文件（开发环境或未配置 Blob 时）
   const stlDir = path.join(process.cwd(), 'public', 'stl-models');
   try {
     if (!fs.existsSync(stlDir)) { fs.mkdirSync(stlDir, { recursive: true }); return []; }
     const files = fs.readdirSync(stlDir);
-    const filtered = files.filter(f =>
-      f.toLowerCase().endsWith('.stl') && f.replace('.stl', '').toLowerCase().includes(q)
-    );
-    return filtered.map(f => ({
-      id: `local-${f}`,
-      title: f.replace('.stl', ''),
-      url: `/stl-models/${f}`,
-      downloadUrl: `/stl-models/${f}`,
-      snippet: '本地STL模型',
-      siteName: '我的图书馆',
-      verifiedFree: true,
-      isLocal: true,
-    }));
+    const metadata = await readLibraryMetadata();
+    const metaByKey = new Map(metadata.items.filter(i => i.status === 'approved').map(i => [i.key, i]));
+    return files.filter(f => f.toLowerCase().endsWith('.stl')).filter(f => {
+      const name = (metaByKey.get(f) ? makeDisplayFilename(metaByKey.get(f)!) : f).replace(/\.stl$/i, '').toLowerCase();
+      return name.includes(q);
+    }).map(f => {
+      const meta = metaByKey.get(f);
+      const filename = meta ? makeDisplayFilename(meta) : f;
+      return {
+        id: `local-${f}`, title: filename.replace('.stl', ''), url: `/stl-models/${f}`,
+        downloadUrl: `/stl-models/${f}`, snippet: '本地STL模型', siteName: '我的图书馆',
+        verifiedFree: true, resultKind: 'model' as const, isLocal: true, isRealDetailPage: false,
+        downloadMode: 'direct' as const, canDirectDownload: true, downloadHint: '本地模型，可直接下载',
+      };
+    });
   } catch { return []; }
 }
 
-// ===================== 合并去重 =====================
 function dedup(...arrays: SearchResult[][]): SearchResult[] {
   const seen = new Set<string>();
   return arrays.flat().filter(item => {
@@ -347,72 +230,246 @@ function dedup(...arrays: SearchResult[][]): SearchResult[] {
   });
 }
 
-// ===================== POST 主入口 =====================
-export async function POST(request: NextRequest) {
+function sortResults(results: SearchResult[]): SearchResult[] {
+  return [...results].sort((a, b) => resultPriority(a) - resultPriority(b));
+}
+
+const FALLBACK_SITES: Array<{ siteId: string; siteName: string; searchUrlFn: (kw: string) => string }> = [
+  { siteId: 'thingiverse', siteName: 'Thingiverse', searchUrlFn: (kw) => `https://www.thingiverse.com/search?q=${encodeURIComponent(kw + ' stl')}&type=things` },
+  { siteId: 'printables', siteName: 'Printables', searchUrlFn: (kw) => `https://www.printables.com/search/models?q=${encodeURIComponent(kw + ' stl')}` },
+  { siteId: 'yeggi', siteName: 'Yeggi', searchUrlFn: (kw) => `https://www.yeggi.com/q/${encodeURIComponent(kw + ' stl')}/` },
+  { siteId: '3d66', siteName: '3D溜溜网', searchUrlFn: (kw) => `https://3d.3d66.com/model/${encodeURIComponent(kw)}_1.html?sws=1` },
+];
+
+function buildFallbackCards(keyword: string, existingSiteIds: Set<string>): SearchResult[] {
+  return FALLBACK_SITES
+    .filter(s => !existingSiteIds.has(s.siteId))
+    .map(s => ({
+      id: `fallback-${s.siteId}-${keyword}`,
+      title: `在 ${s.siteName} 搜索"${keyword}"`,
+      url: s.searchUrlFn(keyword),
+      snippet: `${s.siteName} 站内搜索，点击查看完整结果`,
+      siteName: s.siteName,
+      verifiedFree: false,
+      resultKind: 'model' as const,
+      downloadMode: 'external_search' as const,
+      isRecommendedSite: true,
+      siteId: s.siteId,
+      sourceSearchUrl: s.searchUrlFn(keyword),
+    }));
+}
+
+function finalize(keyword: string, merged: SearchResult[], crawledCount: number, cached = false, full = false, sourceStats?: Record<string, number>) {
+  const sorted = sortResults(merged);
+  const resultsWithMode = sorted.map(r => ({
+    ...r,
+    sourceSearchUrl: r.sourceSearchUrl || buildSiteSearchUrl(r.siteName, keyword) || undefined,
+  }));
+  const modelCount = resultsWithMode.filter(r => r.resultKind === 'model').length;
+  const suggestionCount = resultsWithMode.filter(r => r.resultKind === 'search_suggestion').length;
+  return {
+    success: true, results: resultsWithMode, total: resultsWithMode.length,
+    hasResult: modelCount > 0, searchKeyword: keyword,
+    emptyTip: modelCount > 0 ? '' : '未找到可直接下载的模型，可点击推荐站点跳转原站搜索',
+    crawledCount, cached, full, modelCount, suggestionCount,
+    ...(sourceStats ? { sourceStats } : {}),
+  };
+}
+
+async function runFast(keyword: string, count: number) {
+  const [localResults] = await Promise.all([searchLocalModels(keyword)]);
+  return { results: dedup(localResults).slice(0, count) };
+}
+
+async function runDeep(keyword: string, count: number, excludeUrls: Set<string>, hasAgentToken = false) {
+  const allVariants = getKeywordVariants(keyword);
+  const variants = allVariants.slice(0, 3); // 每源最多 3 个变体，防止并发爆炸
+  console.log(`[runDeep] keyword="${keyword}" variants=${variants.length}/${allVariants.length} [${variants.join(',')}]`);
+
+  const sourceStats: Record<string, number> = { aigei: 0, yeggi: 0, '3d66': 0 };
+  const allBatches: SearchResult[][] = [];
+
+  // 分批串行，每批 2 个变体（40 并发 → ~6 并发）
+  const BATCH_SIZE = 2;
+  for (let i = 0; i < variants.length; i += BATCH_SIZE) {
+    const batch = variants.slice(i, i + BATCH_SIZE);
+    const batchIdx = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(variants.length / BATCH_SIZE);
+    console.log(`[runDeep] 批次 ${batchIdx}/${totalBatches}: [${batch.join(',')}]`);
+
+    const batchResults = await Promise.all(batch.map(async variant => {
+      const [providerResults, legacyResults] = await Promise.all([
+        searchViaProviders(variant, 10, hasAgentToken),
+        Promise.all([
+          search3D66Legacy(variant),
+          searchAigeiLegacy(variant),
+          searchYeggiLegacy(variant),
+        ]).then(r => r.flat()),
+      ]);
+      return { providerResults, legacyResults };
+    }));
+
+    for (const { providerResults, legacyResults } of batchResults) {
+      for (const r of providerResults) {
+        if (r.siteId) sourceStats[r.siteId] = (sourceStats[r.siteId] || 0) + 1;
+      }
+      for (const r of legacyResults) {
+        if (r.siteId) sourceStats[r.siteId] = (sourceStats[r.siteId] || 0) + 1;
+      }
+      allBatches.push([...providerResults, ...legacyResults]);
+    }
+  }
+
+  const results = dedup(...allBatches).filter(r => !excludeUrls.has(r.downloadUrl || r.url));
+  // 没有真实结果时，为没有返回结果的站点生成兜底搜索卡片
+  if (results.length === 0) {
+    const existingSiteIds = new Set(Object.keys(sourceStats).filter(k => sourceStats[k] > 0));
+    const fallbacks = buildFallbackCards(keyword, existingSiteIds);
+    console.log(`[runDeep] 无真实结果，生成 ${fallbacks.length} 个站点兜底卡片`);
+    return { results: fallbacks, crawledCount: 0, sourceStats };
+  }
+  console.log(`[runDeep] 总计 ${results.length} 条去重结果`, sourceStats);
+  return { results: sortResults(results).slice(0, count), crawledCount: results.length, sourceStats };
+}
+
+const AGENT_URL = process.env.BROWSER_AGENT_URL || 'http://127.0.0.1:18789';
+const AGENT_TOKEN = process.env.BROWSER_AGENT_TOKEN || '';
+
+async function searchViaAgent(keyword: string, excludeUrls: Set<string>, token?: string): Promise<SearchResult[]> {
+  const agentToken = token || AGENT_TOKEN;
+  if (!agentToken) return [];
   try {
-    const { query, count = 30 } = await request.json();
-    const keyword = query?.trim() || '';
-    const expandedKw = expandKeyword(keyword);
-
-    // 并行爬取所有来源
-    const [localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, siteLinks] = await Promise.all([
-      searchLocalModels(keyword),
-      Promise.resolve(searchCuratedModels(keyword || expandedKw)),
-      crawlThingiverse(expandedKw).catch(() => []),
-      crawlAigei(expandedKw).catch(() => []),
-      crawlYeggi(expandedKw).catch(() => []),
-      Promise.resolve(crawlSTLSites(keyword)),
-    ]);
-
-    // 合并：本地 > 精选库 > Thingiverse > 爱给网 > Yeggi > 站点跳转
-    const merged = dedup(
-      localResults,
-      curatedResults,
-      thingiverseResults,
-      aigeiResults,
-      yeggiResults,
-      siteLinks
-    ).slice(0, count);
-
-    const hasReal = merged.some(r => r.downloadUrl && !r.isRecommendedSite);
-
-    return NextResponse.json({
-      success: true,
-      results: merged,
-      total: merged.length,
-      hasResult: hasReal || merged.length > 0,
-      emptyTip: hasReal ? '' : '未找到有效模型，可点击下方推荐站点跳转',
-      curatedCount: curatedResults.length,
-      crawledCount: thingiverseResults.length + aigeiResults.length + yeggiResults.length,
+    const res = await fetch(AGENT_URL + '/agent-search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-agent-token': agentToken },
+      body: JSON.stringify({ keyword, sites: ['thingiverse', 'printables', 'yeggi'] }),
+      signal: AbortSignal.timeout(90000),
     });
-  } catch (error) {
-    console.error('[search-stl] POST 错误:', error);
-    return NextResponse.json({ success: false, error: '搜索失败', results: [], total: 0, hasResult: false });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data.success || !Array.isArray(data.results)) return [];
+
+    return data.results.map((r: any) => {
+      const siteNameMap: Record<string, string> = {
+        thingiverse: 'Thingiverse', printables: 'Printables', yeggi: 'Yeggi',
+      };
+      const siteName = siteNameMap[r.site] || r.site;
+      const siteId = r.site || 'unknown';
+      return {
+        id: r.id || 'agent-' + Math.random(),
+        title: r.title || '',
+        url: r.detailUrl || '',
+        downloadUrl: undefined,
+        snippet: '[Browser Agent] ' + siteName + ': ' + (r.title || ''),
+        siteName,
+        verifiedFree: false,
+        resultKind: 'model' as const,
+        downloadMode: 'resolve' as const,
+        downloadHint: 'Browser Agent 已解析，点击下载',
+        sourceDetailUrl: r.detailUrl,
+        sourceSearchUrl: r.detailUrl,
+        isRealDetailPage: true,
+        siteId,
+        thumbnail: r.thumbnail,
+      };
+    });
+  } catch (e) {
+    console.error('[agent] 搜索失败:', e instanceof Error ? e.message : e);
+    return [];
   }
 }
 
-// ===================== GET =====================
+async function runDeepWithAgent(keyword: string, count: number, excludeUrls: Set<string>, agentToken?: string) {
+  const agentPromise = searchViaAgent(keyword, excludeUrls, agentToken);
+  const legacyPromise = runDeep(keyword, count, excludeUrls, !!agentToken);
+  const [agentResults, legacyResult] = await Promise.all([agentPromise, legacyPromise]);
+  const combined = [...legacyResult.results, ...agentResults];
+  const deduped = dedup(combined).filter(r => !excludeUrls.has(r.downloadUrl || r.url));
+  console.log('[runDeepWithAgent] agent=' + agentResults.length + ' legacy=' + legacyResult.results.length + ' dedup=' + deduped.length);
+  return { results: deduped.slice(0, count), crawledCount: deduped.length, sourceStats: legacyResult.sourceStats };
+}
+
+interface SearchCacheEntry { fast: SearchResult[]; deep: SearchResult[]; time: number; }
+const searchCache = new Map<string, SearchCacheEntry>();
+const SEARCH_CACHE_TTL = 10 * 60 * 1000;
+const SEARCH_CACHE_MAX = 200;
+
+function cacheKeyFn(kw: string): string { return kw.trim().toLowerCase(); }
+function readCache(key: string): SearchCacheEntry | null {
+  const e = searchCache.get(key);
+  if (!e || Date.now() - e.time > SEARCH_CACHE_TTL) { searchCache.delete(key); return null; }
+  e.time = Date.now(); return e;
+}
+function writeCache(key: string, patch: Partial<SearchCacheEntry>) {
+  const e = searchCache.get(key);
+  if (e) { Object.assign(e, patch, { time: Date.now() }); }
+  else { searchCache.set(key, { fast: [], deep: [], time: Date.now(), ...patch }); }
+  while (searchCache.size > SEARCH_CACHE_MAX) {
+    const oldest = searchCache.keys().next().value;
+    if (oldest === undefined) break;
+    searchCache.delete(oldest);
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const { query, count = 30, phase = 'fast' } = await request.json();
+    const keyword = query?.trim() || '';
+    const key = cacheKeyFn(keyword);
+
+    // Agent token: 优先从请求头获取（前端 localStorage），其次从环境变量
+    const agentToken = request.headers.get('x-browser-agent-token') || AGENT_TOKEN;
+
+    if (phase === 'deep') {
+      const entry = readCache(key);
+      if (entry?.deep && entry.deep.length > 0) {
+        return NextResponse.json(finalize(keyword, entry.deep, entry.deep.length, true, true));
+      }
+      let fastResults: SearchResult[] = entry?.fast || [];
+      if (fastResults.length === 0) {
+        const fast = await runFast(keyword, count);
+        fastResults = fast.results;
+      }
+      const excludeUrls = new Set(fastResults.map(r => r.downloadUrl || r.url));
+      const hasAgentToken = !!(agentToken);
+      const deepFn = hasAgentToken ? (k: string, c: number, e: Set<string>) => runDeepWithAgent(k, c, e, agentToken) : (k: string, c: number, e: Set<string>) => runDeep(k, c, e, false);
+      const { results, crawledCount, sourceStats } = await deepFn(keyword, count, excludeUrls);
+      writeCache(key, { fast: fastResults, deep: results });
+      return NextResponse.json(finalize(keyword, results, crawledCount, false, false, sourceStats));
+    }
+
+    const entry = readCache(key);
+    if (entry?.fast && entry.fast.length > 0) {
+      if (entry.deep && entry.deep.length > 0) {
+        const { results: freshFast } = await runFast(keyword, count);
+        const merged = dedup(freshFast, entry.deep).slice(0, count);
+        return NextResponse.json(finalize(keyword, merged, entry.deep.length, true, true));
+      }
+      return NextResponse.json(finalize(keyword, entry.fast, 0, true, false));
+    }
+
+    const { results } = await runFast(keyword, count);
+    writeCache(key, { fast: results });
+    return NextResponse.json(finalize(keyword, results, 0, false, false));
+  } catch (error: any) {
+    console.error('[search-stl] POST error:', error?.message, error?.stack);
+    return NextResponse.json({ success: false, error: '搜索失败: ' + (error?.message || 'unknown'), results: [], total: 0, hasResult: false });
+  }
+}
+
 export async function GET(request: NextRequest) {
   const keyword = request.nextUrl.searchParams.get('keyword') || request.nextUrl.searchParams.get('query') || '';
-  const expandedKw = expandKeyword(keyword);
-
-  const [localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, siteLinks] = await Promise.all([
-    searchLocalModels(keyword),
-    Promise.resolve(searchCuratedModels(keyword || expandedKw)),
-    crawlThingiverse(expandedKw).catch(() => []),
-    crawlAigei(expandedKw).catch(() => []),
-    crawlYeggi(expandedKw).catch(() => []),
-    Promise.resolve(crawlSTLSites(keyword)),
-  ]);
-
-  const merged = dedup(localResults, curatedResults, thingiverseResults, aigeiResults, yeggiResults, siteLinks).slice(0, 30);
-  const hasReal = merged.some(r => r.downloadUrl && !r.isRecommendedSite);
-
-  return NextResponse.json({
-    success: true,
-    results: merged,
-    total: merged.length,
-    hasResult: hasReal || merged.length > 0,
-    emptyTip: hasReal ? '' : '未找到有效模型',
-  });
+  try {
+    const fast = await runFast(keyword, 30);
+    const excludeUrls = new Set(fast.results.map(r => r.downloadUrl || r.url));
+    const agentToken = request.headers.get('x-browser-agent-token') || AGENT_TOKEN;
+    const hasAgentToken = !!(agentToken);
+    const deepFn = hasAgentToken ? (k: string, c: number, e: Set<string>) => runDeepWithAgent(k, c, e, agentToken!) : (k: string, c: number, e: Set<string>) => runDeep(k, c, e, false);
+    const deep = await deepFn(keyword, 30, excludeUrls);
+    const merged = dedup(fast.results, deep.results).slice(0, 30);
+    return NextResponse.json(finalize(keyword, merged, deep.crawledCount, false, false, deep.sourceStats));
+  } catch (error) {
+    console.error('[search-stl] GET error:', error);
+    return NextResponse.json({ success: false, error: '搜索失败', results: [], total: 0, hasResult: false });
+  }
 }

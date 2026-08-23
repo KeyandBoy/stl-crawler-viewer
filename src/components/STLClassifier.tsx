@@ -3,11 +3,13 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
 import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
-
-interface ClassificationResult {
-  className: string;
-  probability: number;
-}
+import {
+  tryInitCustomModel,
+  classifyWithCustomModel,
+  isCustomModelAvailable,
+} from '@/lib/classifier/customModelClassifier';
+import { classifyByFilename } from '@/lib/classifier/rules';
+import type { ClassificationResult } from '@/lib/classifier/rules';
 
 interface STLClassifierProps {
   url: string;
@@ -15,80 +17,29 @@ interface STLClassifierProps {
 }
 
 // ─────────────────────────────────────────────
-// 1. 分类规则：优先级从高到低排列
-//    每条规则：{ label, keywords, weight }
-//    keywords 中任意一个命中文件名即得分 weight
+// 1. 豆包 AI 文本兜底（文件名命中置信度不足时调用）
+//    Key 只存在服务器 .env，浏览器请求走 /api/classify-doubao 中转
 // ─────────────────────────────────────────────
-interface Rule {
-  label: string;
-  keywords: string[];
-  weight: number;
+const DOUBAO_MIN_CONFIDENCE = 0.7;
+
+async function classifyWithDoubao(filename: string, filenameResults: ClassificationResult[]): Promise<ClassificationResult[] | null> {
+  const top = filenameResults[0];
+  if (top && top.probability >= DOUBAO_MIN_CONFIDENCE) return null;
+  try {
+    const res = await fetch('/api/classify-doubao', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    });
+    const data = await res.json();
+    if (data?.success && typeof data.category === 'string') {
+      return [{ className: data.category, probability: 0.9 }];
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
-
-const RULES: Rule[] = [
-  // ── 亭台楼阁（最高优先级，细分类型）──
-  { label: '六角亭', keywords: ['六角亭','hexagonal pavilion','hexagonal gazebo','6-sided pavilion','liujiao'], weight: 1.0 },
-  { label: '八角亭', keywords: ['八角亭','octagonal pavilion','octagonal gazebo','8-sided pavilion','bajiao'], weight: 1.0 },
-  { label: '四角亭', keywords: ['四角亭','square pavilion','4-sided pavilion','sijiao'], weight: 1.0 },
-  { label: '圆亭',   keywords: ['圆亭','round pavilion','circular pavilion','yuanting'], weight: 1.0 },
-  { label: '廊亭',   keywords: ['廊亭','corridor pavilion','covered walkway pavilion'], weight: 1.0 },
-  { label: '亭子',   keywords: ['亭子','亭台','凉亭','亭','pavilion','gazebo','kiosk','booth'], weight: 0.9 },
-  { label: '楼阁',   keywords: ['楼阁','阁楼','阁','楼','loft','attic','storied building','tower house','lou','ge'], weight: 0.9 },
-  { label: '台',     keywords: ['台','观星台','烽火台','点将台','拜月台','platform','terrace','stage platform'], weight: 0.85 },
-  { label: '戏台',   keywords: ['戏台','古戏台','戏楼','opera stage','stage','xitai'], weight: 0.95 },
-  { label: '廊',     keywords: ['廊','回廊','游廊','连廊','corridor','covered walkway','lang'], weight: 0.85 },
-
-  // ── 塔（细分）──
-  { label: '宝塔',   keywords: ['宝塔','佛塔','pagoda','stupa','buddhist tower','baota'], weight: 1.0 },
-  { label: '木塔',   keywords: ['木塔','wooden tower','wooden pagoda','muta'], weight: 1.0 },
-  { label: '砖塔',   keywords: ['砖塔','brick tower','brick pagoda','zhuanta'], weight: 1.0 },
-  { label: '石塔',   keywords: ['石塔','stone tower','stone pagoda','shita'], weight: 1.0 },
-  { label: '雁塔',   keywords: ['雁塔','大雁塔','小雁塔','wild goose pagoda','yanta'], weight: 1.0 },
-  { label: '塔',     keywords: ['塔','tower','turret','minaret','spire'], weight: 0.85 },
-
-  // ── 桥（细分）──
-  { label: '廊桥',   keywords: ['廊桥','风雨桥','covered bridge','langqiao'], weight: 1.0 },
-  { label: '石拱桥', keywords: ['石拱桥','拱桥','arch bridge','stone arch','shigongqiao'], weight: 1.0 },
-  { label: '木桥',   keywords: ['木桥','wooden bridge','muqiao'], weight: 1.0 },
-  { label: '索桥',   keywords: ['索桥','吊桥','suspension bridge','rope bridge','suoqiao'], weight: 1.0 },
-  { label: '桥',     keywords: ['桥','bridge','viaduct','overpass','qiao'], weight: 0.85 },
-
-  // ── 门楼牌坊（细分）──
-  { label: '牌坊',   keywords: ['牌坊','牌楼','石牌坊','木牌坊','功德坊','archway','memorial arch','paifang','pailou'], weight: 1.0 },
-  { label: '城门',   keywords: ['城门','城楼','gate tower','city gate','chengmen'], weight: 1.0 },
-  { label: '门楼',   keywords: ['门楼','宅门','大门','gate','entrance gate','menlou'], weight: 0.9 },
-
-  // ── 殿堂庙宇（细分）──
-  { label: '大殿',   keywords: ['大殿','正殿','宫殿','金銮殿','大雄宝殿','main hall','palace hall','dadian'], weight: 1.0 },
-  { label: '庙宇',   keywords: ['庙','寺庙','道观','文庙','城隍庙','土地庙','temple','shrine','taoist temple','miao'], weight: 0.9 },
-  { label: '寺院',   keywords: ['寺','寺院','佛寺','禅寺','monastery','buddhist temple','si'], weight: 0.9 },
-  { label: '祠堂',   keywords: ['祠','宗祠','祠堂','家祠','ancestral hall','clan hall','citang'], weight: 1.0 },
-
-  // ── 民居院落（细分）──
-  { label: '四合院', keywords: ['四合院','北京四合院','siheyuan','courtyard house','beijing courtyard'], weight: 1.0 },
-  { label: '徽派民居', keywords: ['徽派','徽州','马头墙','天井','huizhou','huipai','horse head wall'], weight: 1.0 },
-  { label: '客家土楼', keywords: ['土楼','客家','tulou','hakka','earthen building'], weight: 1.0 },
-  { label: '吊脚楼', keywords: ['吊脚楼','苗族','侗族','stilted house','diaojiaolou'], weight: 1.0 },
-  { label: '民居',   keywords: ['民居','民宅','住宅','古民居','traditional house','vernacular','minjv'], weight: 0.85 },
-
-  // ── 园林景观 ──
-  { label: '假山',   keywords: ['假山','太湖石','rockery','artificial mountain','jiashan'], weight: 1.0 },
-  { label: '水榭',   keywords: ['水榭','水亭','waterside pavilion','shuixie'], weight: 1.0 },
-  { label: '园林',   keywords: ['园林','花园','苏州园林','garden','classical garden','yuanlin'], weight: 0.85 },
-
-  // ── 装饰构件 ──
-  { label: '斗拱',   keywords: ['斗拱','dougong','bracket set','corbel bracket'], weight: 1.0 },
-  { label: '飞檐',   keywords: ['飞檐','翘角','upturned eave','flying eave','feiyuan'], weight: 1.0 },
-  { label: '榫卯',   keywords: ['榫卯','榫','卯','mortise','tenon','joinery','sunmao'], weight: 1.0 },
-  { label: '龙',     keywords: ['龙','龙纹','龙雕','螭龙','dragon','loong'], weight: 0.95 },
-  { label: '凤',     keywords: ['凤','凤凰','phoenix','fenghuang'], weight: 0.95 },
-  { label: '石狮',   keywords: ['石狮','狮子','guardian lion','stone lion','shishi'], weight: 0.95 },
-  { label: '雕塑',   keywords: ['雕塑','雕像','石雕','木雕','sculpture','statue','carving'], weight: 0.8 },
-
-  // ── 通用建筑（兜底）──
-  { label: '古建筑', keywords: ['古建筑','古建','中式建筑','传统建筑','ancient architecture','chinese architecture'], weight: 0.75 },
-  { label: '建筑',   keywords: ['building','architecture','structure','edifice'], weight: 0.5 },
-];
 
 // ─────────────────────────────────────────────
 // 2. MobileNet 输出 → 中文建筑类别映射
@@ -131,33 +82,6 @@ const MOBILENET_MAP: Array<{ pattern: string; label: string; score: number }> = 
 ];
 
 // ─────────────────────────────────────────────
-// 3. 文件名分类（基于规则表）
-// ─────────────────────────────────────────────
-function classifyByFilename(filename: string): ClassificationResult[] {
-  const lower = filename.toLowerCase();
-  const scores = new Map<string, number>();
-
-  for (const rule of RULES) {
-    for (const kw of rule.keywords) {
-      if (lower.includes(kw.toLowerCase())) {
-        const prev = scores.get(rule.label) || 0;
-        scores.set(rule.label, Math.max(prev, rule.weight));
-        break; // 同一规则只计一次
-      }
-    }
-  }
-
-  if (scores.size === 0) {
-    return [{ className: '未分类', probability: 0.4 }];
-  }
-
-  return Array.from(scores.entries())
-    .map(([className, probability]) => ({ className, probability }))
-    .sort((a, b) => b.probability - a.probability)
-    .slice(0, 5);
-}
-
-// ─────────────────────────────────────────────
 // 4. MobileNet 输出 → 建筑类别映射
 // ─────────────────────────────────────────────
 function mapMobileNetToArchitecture(mobilenetClass: string, probability: number): { label: string; score: number } | null {
@@ -198,15 +122,85 @@ function mergeClassifications(
     .slice(0, 5);
 }
 
+// ── 分类模式 ─────────────────────────────────
+/**
+ * fast 模式：文件名规则 + MobileNet（当前默认）
+ * custom 模式：仅使用训练器导出的专用模型
+ * hybrid 模式：文件名规则 + MobileNet + 专用模型加权融合（默认）
+ */
+type ClassifierMode = 'fast' | 'custom' | 'hybrid';
+
+// ─────────────────────────────────────────────
+// 5b. 三路融合（fast + custom 混合）
+//     hybrid 模式使用此函数
+// ─────────────────────────────────────────────
+/**
+ * mergeHybridClassifications
+ *
+ * 三路加权融合：
+ * - 如果 customResults 有结果：
+ *   custom 权重 0.7, filename 权重 0.2, mobilenet 权重 0.1
+ * - 如果 customResults 为空（专用模型未加载/预测失败）：
+ *   沿用 fast 融合：filename 权重 0.6, mobilenet 权重 0.4
+ *
+ * 输出前 5 个结果，概率不超过 1.0。
+ */
+function mergeHybridClassifications(
+  filenameResults: ClassificationResult[],
+  mobilenetResults: ClassificationResult[],
+  customResults: ClassificationResult[]
+): ClassificationResult[] {
+  const scores = new Map<string, number>();
+
+  if (customResults.length > 0) {
+    // hybrid：custom 主导
+    for (const r of filenameResults) {
+      scores.set(r.className, (scores.get(r.className) || 0) + r.probability * 0.2);
+    }
+    for (const r of mobilenetResults) {
+      scores.set(r.className, (scores.get(r.className) || 0) + r.probability * 0.1);
+    }
+    for (const r of customResults) {
+      scores.set(r.className, (scores.get(r.className) || 0) + r.probability * 0.7);
+    }
+  } else {
+    // fallback：fast 融合（原逻辑）
+    for (const r of filenameResults) {
+      scores.set(r.className, (scores.get(r.className) || 0) + r.probability * 0.6);
+    }
+    for (const r of mobilenetResults) {
+      scores.set(r.className, (scores.get(r.className) || 0) + r.probability * 0.4);
+    }
+  }
+
+  return Array.from(scores.entries())
+    .map(([className, probability]) => ({
+      className,
+      probability: Math.min(probability, 1.0),
+    }))
+    .sort((a, b) => b.probability - a.probability)
+    .slice(0, 5);
+}
+
 // ─────────────────────────────────────────────
 // 6. TensorFlow.js 初始化（带超时 + 多后端降级）
 // ─────────────────────────────────────────────
-let tfInstance: any = null;
-let mobilenetInstance: any = null;
+interface TFType {
+  setBackend: (name: string) => Promise<boolean>;
+  ready: () => Promise<void>;
+  getBackend: () => string;
+}
+
+interface MobileNetType {
+  classify: (img: HTMLImageElement, topK: number) => Promise<Array<{ className: string; probability: number }>>;
+}
+
+let tfInstance: TFType | null = null;
+let mobilenetInstance: MobileNetType | null = null;
 let tfInitializing = false;
 let tfInitFailed = false;
 
-async function tryInitTensorFlow(): Promise<{ tf: any; mobilenet: any } | null> {
+async function tryInitTensorFlow(): Promise<{ tf: TFType; mobilenet: MobileNetType } | null> {
   if (tfInitFailed) return null;
   if (tfInstance && mobilenetInstance) return { tf: tfInstance, mobilenet: mobilenetInstance };
   if (tfInitializing) {
@@ -236,8 +230,8 @@ async function tryInitTensorFlow(): Promise<{ tf: any; mobilenet: any } | null> 
       ),
     ]);
 
-    tfInstance = tf;
-    mobilenetInstance = model;
+    tfInstance = tf as unknown as TFType;
+    mobilenetInstance = model as unknown as MobileNetType;
     tfInitializing = false;
     console.log('[STLClassifier] MobileNet ready');
     return { tf, mobilenet: model };
@@ -341,8 +335,23 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
   const [results, setResults] = useState<ClassificationResult[]>([]);
   const [usingFallback, setUsingFallback] = useState(false);
   const [isClient, setIsClient] = useState(false);
+  const [classifierMode, setClassifierMode] = useState<ClassifierMode>('fast');
+  const [customModelAvailable, setCustomModelAvailable] = useState(false);
 
-  useEffect(() => { setIsClient(true); }, []);
+  // 启动时尝试加载专用模型
+  useEffect(() => {
+    setIsClient(true);
+    (async () => {
+      const ok = await tryInitCustomModel();
+      setCustomModelAvailable(ok);
+      setClassifierMode(ok ? 'hybrid' : 'fast');
+      if (ok) {
+        console.log('[STLClassifier] 专用古建筑分类模型已加载，使用 hybrid 模式');
+      } else {
+        console.log('[STLClassifier] 未检测到专用模型，使用 fast 模式');
+      }
+    })();
+  }, []);
 
   const handleClassify = async () => {
     if (!url || !isClient || !canvasRef.current) return;
@@ -357,7 +366,18 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
         .replace(/\.stl$/i, '');
       const filenameResults = classifyByFilename(filename);
 
-      // 尝试 AI 分类
+      // 豆包 AI 兜底：文件名命中且置信度达标则直接用规则结果；
+      // 未命中或置信度不足时调豆包文本分类，成功则跳过重量级 TF 流程
+      setStatus('AI 兜底分析中…');
+      const doubaoResults = await classifyWithDoubao(filename, filenameResults);
+      if (doubaoResults) {
+        setResults(doubaoResults);
+        if (onClassify) onClassify(doubaoResults);
+        setStatus('分类完成（豆包 AI）');
+        return;
+      }
+
+      // 尝试 AI 分类（MobileNet + 可选专用模型）
       setStatus('初始化 AI...');
       const tfResult = await tryInitTensorFlow();
 
@@ -370,6 +390,7 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
           const images = await renderSTLToImages(fetchUrl, canvasRef.current);
           setStatus(`分析 ${images.length} 个视角...`);
 
+          // MobileNet 分类
           const aiScores = new Map<string, number>();
           for (let i = 0; i < images.length; i++) {
             setStatus(`AI 分析 ${i + 1}/${images.length}...`);
@@ -394,7 +415,25 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
             .sort((a, b) => b.probability - a.probability)
             .slice(0, 5);
 
-          const merged = mergeClassifications(filenameResults, aiResults);
+          // 专用模型分类（custom / hybrid 模式）
+          let customResults: ClassificationResult[] = [];
+          if (customModelAvailable) {
+            setStatus('专用模型分析中...');
+            customResults = await classifyWithCustomModel(images);
+          }
+
+          // 根据分类模式选择融合策略
+          let merged: ClassificationResult[];
+          if (customModelAvailable) {
+            // hybrid 模式：三路融合
+            merged = mergeHybridClassifications(filenameResults, aiResults, customResults);
+            setStatus('混合分类完成');
+          } else {
+            // fast 模式：原双路融合
+            merged = mergeClassifications(filenameResults, aiResults);
+            setStatus('分类完成');
+          }
+
           setResults(merged);
           if (onClassify) onClassify(merged);
         } catch {
@@ -402,14 +441,14 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
           setResults(filenameResults);
           setUsingFallback(true);
           if (onClassify) onClassify(filenameResults);
+          setStatus('分类完成（备用模式）');
         }
       } else {
         setUsingFallback(true);
         setResults(filenameResults);
         if (onClassify) onClassify(filenameResults);
+        setStatus('分类完成（文件名模式）');
       }
-
-      setStatus('分类完成');
     } catch (err) {
       console.error('[STLClassifier]', err);
       const filename = decodeURIComponent(url.split('/').pop() || 'unknown').replace(/\.stl$/i, '');
@@ -452,6 +491,15 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
         )}
       </button>
 
+      {/* 分类模式提示 */}
+      {!loading && !usingFallback && isClient && (
+        <p className="text-xs text-gray-500 bg-gray-50 border border-gray-200 rounded px-2 py-1">
+          {customModelAvailable
+            ? '🧠 分类模式：混合分类（专用模型 + MobileNet + 规则）'
+            : '💡 未检测到可用专用模型，使用快速分类模式'}
+        </p>
+      )}
+
       {usingFallback && !loading && results.length > 0 && (
         <p className="text-xs text-yellow-600 bg-yellow-50 border border-yellow-200 rounded px-2 py-1">
           💡 使用文件名分类（AI 模型未加载）
@@ -487,20 +535,31 @@ export function STLClassifier({ url, onClassify }: STLClassifierProps) {
 
 // ─────────────────────────────────────────────
 // 9. 批量分类工具函数（供 page.tsx 调用）
+//     自动使用 hybrid 或 fast 模式
 // ─────────────────────────────────────────────
 export async function classifySTLModel(url: string): Promise<ClassificationResult[]> {
   if (typeof window === 'undefined') throw new Error('仅限浏览器环境');
 
+  // 1. 文件名分类（始终优先）
   const filename = decodeURIComponent(url.split('/').pop() || 'unknown').replace(/\.stl$/i, '');
   const filenameResults = classifyByFilename(filename);
 
+  // 1b. 豆包 AI 兜底：未命中或置信度不足时尝试文本分类
+  try {
+    const doubaoResults = await classifyWithDoubao(filename, filenameResults);
+    if (doubaoResults) return doubaoResults;
+  } catch { /* 忽略，走原有流程 */ }
+
+  // 2. 尝试 AI 分类
   const tfResult = await tryInitTensorFlow();
   if (!tfResult) return filenameResults;
 
   try {
+    // 3. 渲染 STL 多视角图像
     const canvas = document.createElement('canvas');
     const images = await renderSTLToImages(url, canvas);
 
+    // 4. MobileNet 分类
     const aiScores = new Map<string, number>();
     for (const imgData of images) {
       const img = new window.Image();
@@ -524,8 +583,22 @@ export async function classifySTLModel(url: string): Promise<ClassificationResul
       .sort((a, b) => b.probability - a.probability)
       .slice(0, 5);
 
+    // 5. 尝试专用模型分类（如可用）
+    let customResults: ClassificationResult[] = [];
+    try {
+      const customOk = await tryInitCustomModel();
+      if (customOk) {
+        customResults = await classifyWithCustomModel(images);
+      }
+    } catch { /* 专用模型失败不中断 */ }
+
+    // 6. 融合
+    if (customResults.length > 0) {
+      return mergeHybridClassifications(filenameResults, aiResults, customResults);
+    }
     return mergeClassifications(filenameResults, aiResults);
   } catch {
+    // 任意环节失败都 fallback 到文件名分类
     return filenameResults;
   }
 }
